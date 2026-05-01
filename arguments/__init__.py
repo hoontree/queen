@@ -128,7 +128,7 @@ class ModelParams(ParamGroup):
 
         self.wandb_project = "queen-dev"
         self.wandb_entity = "nvr-amri"
-        self.wandb_run_name = "test-run"
+        self.wandb_run_name = None
         self.wandb_mode = "online"
         self.wandb_log_images = False
         self.wandb_tags = ""

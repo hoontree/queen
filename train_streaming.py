@@ -3,17 +3,26 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
 
 # Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# CUDA_VISIBLE_DEVICES=3 mamba run -n queen python train.py --config configs/n3dv.yaml -s data/dynerf/n3dv/flame_steak -m ./output/n3dv/
+# Streaming variant of train.py: MP4 videos are decoded frame-by-frame via OpenCV
+# to simulate a live-stream scenario. Measures per-frame video decode latency.
+#
+# Usage example:
+#   mamba run -n queen python train_streaming.py \
+#       --config configs/n3dv.yaml \
+#       --video_dir data/n3dv/flame_steak \
+#       -s data/n3dv/flame_steak \
+#       -m ./output/streaming/flame_steak
 
 import os
 import sys
+import glob
 import torch
 import socket
 from random import randint, Random
@@ -37,20 +46,95 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 from PIL import Image, ImageChops
 import torchvision.transforms.functional as F
+import torchvision.transforms as T
 from utils.image_utils import psnr, save_image, value2color
 from scene.cameras import SequentialCamera, camName_from_Path, imageName_from_Path
 from argparse import ArgumentParser, Namespace
 from utils.general_utils import DecayScheduler, kthvalue
 from utils.graphics_utils import adjust_depths
 from utils.image_utils import resize_image, downsample_image, blur_image, get_mask, write_depth, coords_grid, flow_warp, coords_grid_proj, get_depth, resize_dims
-from utils.loader_utils import MultiViewVideoDataset
-from utils.loader_utils import SequentialMultiviewSampler, MultiViewVideoDataset
 from arguments import ModelParams, PipelineParams, OptimizationParams, QuantizeParams, OptimizationParamsInitial, OptimizationParamsRest
 from scene.utils import get_depth_model, get_depth_poses
 from torchmetrics.functional.regression import pearson_corrcoef
 from MiDaS.run import process
 from scene.decoders import LatentDecoder, LatentDecoderRes, Gate
 from generate_video_all import symlink
+
+
+# ---------------------------------------------------------------------------
+# OpenCV-based multi-camera video stream (replaces MultiViewVideoDataset)
+# ---------------------------------------------------------------------------
+
+class MultiCameraVideoStream:
+    """Wraps N cam*.mp4 files and decodes them one frame at a time via OpenCV.
+
+    Call next_frame() to get one synchronized multi-view frame.
+    decode_times_ms records per-frame wall-clock decode time (all cameras combined).
+    """
+
+    def __init__(self, video_paths: list, test_indices: list,
+                 split: str, max_frames: int = 300, start_idx: int = 0):
+        self._to_tensor = T.ToTensor()
+        self.max_frames = max_frames
+        self.start_idx  = start_idx
+        self.frame_counter = 0
+        self.decode_times_ms: list = []
+
+        self.caps        = []
+        self.video_paths = []
+        for i, vpath in enumerate(video_paths):
+            is_test = i in test_indices
+            if (split == 'test' and not is_test) or (split == 'train' and is_test):
+                continue
+            cap = cv2.VideoCapture(vpath)
+            if not cap.isOpened():
+                raise RuntimeError(f"Cannot open video: {vpath}")
+            if start_idx > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
+            self.caps.append(cap)
+            self.video_paths.append(vpath)
+
+        self.n_cams   = len(self.caps)
+        self.n_frames = max_frames   # upper bound; may stop early at StopIteration
+
+    def next_frame(self):
+        """Decode one frame from every camera.
+
+        Returns:
+            images (N, C, H, W) float32 CPU tensor in [0,1]
+            paths  list[str]  — pseudo-paths used as image_name in cameras
+            decode_ms float   — total decode wall time across all cameras (ms)
+
+        Raises StopIteration when max_frames is exhausted or a camera EOF is hit.
+        """
+        if self.frame_counter >= self.max_frames:
+            raise StopIteration
+
+        t0 = time.perf_counter()
+        frames, paths = [], []
+        for cam_idx, cap in enumerate(self.caps):
+            ret, bgr = cap.read()
+            if not ret:
+                raise StopIteration
+            rgb    = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            tensor = self._to_tensor(Image.fromarray(rgb))   # (C, H, W)
+            frames.append(tensor)
+            # Construct a path that matches the regex in imageName_from_Path:
+            #   r'.*(cam\d*).*\/(.*)\.png'
+            # → "<video_path_stem>/images/NNNN.png"
+            cam_stem = os.path.splitext(self.video_paths[cam_idx])[0]  # strip .mp4
+            paths.append(os.path.join(
+                cam_stem, "images",
+                f"{self.start_idx + self.frame_counter:04d}.png"))
+
+        decode_ms = (time.perf_counter() - t0) * 1000.0
+        self.decode_times_ms.append(decode_ms)
+        self.frame_counter += 1
+        return torch.stack(frames), paths, decode_ms   # (N, C, H, W)
+
+    def release(self):
+        for cap in self.caps:
+            cap.release()
 
 # Disable tqdm to make pdb easier to use
 # Set to False to disable progress bars for debugging
@@ -76,9 +160,9 @@ try:
 except ImportError:
     WANDB_FOUND = False
 
-def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams, qp:QuantizeParams, testing_iterations: list, 
+def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams, qp:QuantizeParams, testing_iterations: list,
              saving_iterations: list, checkpoint_iterations, checkpoint: str, debug_from, args):
-    """Main training function for QUEEN compressed Gaussian splatting."""
+    """Streaming training: MP4 frames are decoded one at a time via OpenCV."""
     wandb_enabled = WANDB_FOUND and dataset.use_wandb
     tb_writer = prepare_output_and_logger(args)
     generator = Random(dataset.seed)
@@ -86,47 +170,51 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
     qp.use_shift = [bool(el) for el in qp.use_shift]
 
-    # Create dataset and loader for training and testing at each time instance
-    train_image_dataset = MultiViewVideoDataset(dataset.source_path, split='train', test_indices=dataset.test_indices,
-                                                max_frames=dataset.max_frames, start_idx=dataset.start_idx, img_format=dataset.img_fmt)
-    test_image_dataset = MultiViewVideoDataset(dataset.source_path, split='test', test_indices=dataset.test_indices, 
-                                               max_frames=dataset.max_frames, start_idx=dataset.start_idx, 
-                                               img_format=dataset.img_fmt)
+    # -- Force-disable features incompatible with streaming ------------------
+    # Flow loss requires the *next* frame to be in memory before training starts.
+    opt.lambda_flow = 0.0
+    opt.opt_rest['lambda_flow_rest'] = 0.0
+    # adaptive_iters requires a precomputed frame_diff.json for the full video.
+    dataset.adaptive_iters = False
 
-    train_sampler = SequentialMultiviewSampler(train_image_dataset)
-    if test_image_dataset.n_cams > 0:
-        test_sampler = SequentialMultiviewSampler(test_image_dataset)
+    # -- Discover MP4 files --------------------------------------------------
+    video_paths = sorted(glob.glob(os.path.join(args.video_dir, "cam*.mp4")))
+    if not video_paths:
+        raise RuntimeError(f"No cam*.mp4 files found in {args.video_dir}")
+    print(f"training(): found {len(video_paths)} camera MP4 files")
 
-    train_loader = iter(torch.utils.data.DataLoader(train_image_dataset, batch_size=train_image_dataset.n_cams, 
-                                                    sampler=train_sampler, num_workers=4))
-    if test_image_dataset.n_cams > 0:
-        test_loader = iter(torch.utils.data.DataLoader(test_image_dataset, batch_size=test_image_dataset.n_cams, 
-                                                        sampler=test_sampler, num_workers=4))
-    
+    train_stream = MultiCameraVideoStream(
+        video_paths, test_indices=dataset.test_indices,
+        split='train', max_frames=dataset.max_frames, start_idx=dataset.start_idx)
+    test_stream = MultiCameraVideoStream(
+        video_paths, test_indices=dataset.test_indices,
+        split='test',  max_frames=dataset.max_frames, start_idx=dataset.start_idx)
+
+    has_test = test_stream.n_cams > 0
+
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     print(f"training(): dataset.white_background set to {dataset.white_background}")
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-    # Initial set of images to initialize camera and camera parameters
-    # Image dimensions should remain constant throughout the video
-    print(f"training(): loading data for the first frame...")
+    # -- Decode first frame --------------------------------------------------
+    print(f"training(): decoding first frame via OpenCV ...")
     tic = time.time()
-    train_data = next(train_loader)
-    train_images, train_paths = train_data  # train_images: (N, C, H, W). If the image files contain RGBA, C can be 4.
+    train_images, train_paths, _decode_ms_0 = train_stream.next_frame()
+    train_images = train_images.cuda()
 
-    if test_image_dataset.n_cams > 0:
-        test_data = next(test_loader)
-        test_images, test_paths = test_data
-        test_image_data = {'image':test_images.cuda(),'path':test_paths,'frame_idx':0}
+    if has_test:
+        test_images, test_paths, _ = test_stream.next_frame()
+        test_images = test_images.cuda()
+        test_image_data = {'image': test_images, 'path': test_paths, 'frame_idx': 0}
     else:
         print('No test cameras found, disabling testing.')
         test_images, test_paths = None, None
-        test_image_data = {'image':None,'path':None,'frame_idx':0}
+        test_image_data = {'image': None, 'path': None, 'frame_idx': 0}
 
-    train_image_data = {'image':train_images.cuda(),'path':train_paths,'frame_idx':0}
-    
-    print(f"training(): data loaded in {float(time.time() - tic):.2f} sec")
+    train_image_data = {'image': train_images, 'path': train_paths, 'frame_idx': 0}
+
+    print(f"training(): first frame decoded in {float(time.time() - tic):.2f} sec")
 
     # Create the gaussian model and scene, initialized with frame 1 images from dataset
     gaussians = GaussianModel(dataset.sh_degree, qp, dataset, use_xyz_legacy=args.use_xyz_legacy)
@@ -135,7 +223,7 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     scene = Scene(
         dataset,
         gaussians,
-        train_image_data= train_image_data,
+        train_image_data=train_image_data,
         test_image_data=test_image_data,
         N_video_views=max_frames
     )
@@ -147,26 +235,21 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
     # Metadata used by various components
     train_cameras = scene.getTrainCameras()
-    n_frames, n_cams = train_image_dataset.n_frames, train_image_dataset.n_cams
-    print(f"training(): running with {n_frames} frames from {n_cams} cameras")
+    n_frames = dataset.max_frames   # upper bound; actual count determined at runtime
+    n_cams   = train_stream.n_cams
+    print(f"training(): streaming up to {n_frames} frames from {n_cams} cameras")
     opt.iterations = opt.epochs*n_cams
     print(f"training(): opt.iterations set to {opt.iterations}")
     _,H,W = train_cameras[0].original_image.shape
 
     cur_frame_views = train_image_data['image']
     prev_frame_views = cur_frame_views
+    prev_xyz = gaussians._xyz.clone()   # needed for lambda_posres even on frame 1
 
-    # Vary number of iterations based on frame difference in json file
-    if dataset.adaptive_iters and n_frames>1:
-        frame_diff = json.load(open(os.path.join(dataset.source_path,'frame_diff.json'),'r'))['l2']
-        frame_diff = np.array(frame_diff[:n_frames-1])
-        epochs_rest = opt.opt_rest['epochs_rest']
-        mult = np.clip(frame_diff/frame_diff.mean(),1/4,4) # between 0.25 to 4
-        mult = mult/mult.mean()
-        frame_epochs = np.ceil((mult*epochs_rest)).astype(np.int32)
-        frame_iters = np.concatenate((np.array([opt.iterations]),frame_epochs*n_cams))
-    else:
-        frame_iters = np.array([opt.iterations]+[opt.opt_rest['epochs_rest']*n_cams]*(n_frames-1))
+    # adaptive_iters is disabled for streaming (no full-video frame_diff.json)
+    # frame_iters is grown dynamically as frames arrive
+    _rest_iters = opt.opt_rest['epochs_rest'] * n_cams
+    frame_iters = np.array([opt.iterations, _rest_iters])   # pre-allocate 2; extended below
     if opt.lambda_depth>0.0 or dataset.depth_init:
 
         ## MiDas model for monocular depth estimation
@@ -212,10 +295,15 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     # Per-component latency accumulators (wall time; GPU-synced when dataset.timed is set).
     # "decode" executes inside render_forward (LatentDecoder called by rasterizer) and cannot
     # be separated from it — timing_metrics.json marks it as an alias of render_forward.
-    _timing_keys = ["gaussian_selection", "render_forward", "motion_estimation",
+    # "video_decode" is the OpenCV frame decode time (per frame, not per iteration).
+    _timing_keys = ["video_decode", "gaussian_selection", "render_forward", "motion_estimation",
                     "loss_backward", "optimizer_step", "densify_prune"]
     _timing_accum = defaultdict(float)
     _timing_count = defaultdict(int)
+
+    # Seed with first-frame decode time (already measured above)
+    _timing_accum["video_decode"] += _decode_ms_0 / 1000.0
+    _timing_count["video_decode"] += 1
 
     def _t_sync():
         """Wall time after optional CUDA sync."""
@@ -244,18 +332,46 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
             wandb.define_metric(f"frame/latency/{_k}_ms", step_metric="frame_idx")
         wandb.define_metric("frame/latency/decode_ms", step_metric="frame_idx")
 
-    if opt.lambda_flow > 0.0:
-        grid = coords_grid(1,H,W, device='cuda')
+    # flow loss is disabled for streaming; skip grid allocation
+    # if opt.lambda_flow > 0.0: grid = coords_grid(...)
 
     if enable_tqdm:
-        progress_bar_frame = tqdm(range(1, n_frames+1), desc="Training progress")
+        progress_bar_frame = tqdm(total=n_frames, desc="Streaming frames")
         progress_bar_frame.update(start_frame_idx-1)
     else:
         progress_bar_frame = None
         frame_counter = 0
 
-    # start frame index loop
-    for frame_idx in range(start_frame_idx, n_frames+1):
+    # start streaming frame loop
+    frame_idx = start_frame_idx
+    cur_train_images = train_images
+    cur_train_paths  = train_paths
+
+    while True:
+        # ── Decode next frame (measures video_decode latency) ─────────────
+        if dataset.timed:
+            torch.cuda.synchronize()
+        _t0_decode = time.perf_counter()
+        try:
+            next_train_images, next_train_paths, _decode_ms = train_stream.next_frame()
+            # Keep on CPU until current frame training completes to reduce GPU memory usage
+            have_next = True
+        except StopIteration:
+            have_next = False
+            _decode_ms = 0.0
+        _timing_accum["video_decode"] += _decode_ms / 1000.0
+        if have_next:
+            _timing_count["video_decode"] += 1
+
+        # Decode matching test frame
+        if has_test:
+            try:
+                next_test_images, next_test_paths, _ = test_stream.next_frame()
+                # Keep on CPU until needed to reduce simultaneous GPU memory usage
+            except StopIteration:
+                next_test_images, next_test_paths = None, None
+        else:
+            next_test_images, next_test_paths = None, None
 
         # Frame-wise metrics for wandb logging
         if wandb_enabled and frame_idx <= 2:
@@ -291,19 +407,6 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
             torch.cuda.synchronize()
         frame_start_io = time.time()
         frame_time_io = 0.0
-
-        try: 
-            # Pre-load data for next frame
-            next_train_data = next(train_loader)
-            next_train_images, next_train_paths = next_train_data[0].cuda(), next_train_data[1]
-            next_frame_views = next_train_images
-
-            orig_size = cur_frame_views.shape[-2:]
-            rescaled_size = resize_dims(orig_size, dataset.flow_scale)
-
-        except StopIteration:
-            assert frame_idx == n_frames
-            opt.lambda_flow = 0.0
 
         if dataset.timed:
             torch.cuda.synchronize()
@@ -368,6 +471,9 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
                 # Load optimizer hyperparams (initial or rest) based on frame index
                 opt.set_params(frame_idx)
+                # Grow frame_iters dynamically if needed
+                if frame_idx - 1 >= len(frame_iters):
+                    frame_iters = np.append(frame_iters, _rest_iters)
                 opt.iterations = frame_iters[frame_idx-1]
                 opt.epochs = (opt.iterations//n_cams)
                 gaussians.frame_idx = frame_idx
@@ -376,18 +482,13 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 gaussians.update_residuals()
                 # Redefine the optimizer and other tracked variables for the gaussian model
                 gaussians.training_setup(opt)
-                # Load the current test data (Preloaded data for next frame is only for training)
                 train_images, train_paths = cur_train_images, cur_train_paths
                 if dataset.timed:
                     torch.cuda.synchronize()
                 frame_time += time.time() - frame_start
-                if test_image_dataset.n_cams > 0:
-                    test_data = next(test_loader)
-                    test_images, test_paths = test_data[0].cuda(), test_data[1]
-                else:
-                    if frame_idx == start_frame_idx:
-                        print('No test cameras found, disabling testing.')
-                    test_images, test_paths = None, None
+                # Move test frame to GPU now (kept on CPU since decode to save memory)
+                test_images = next_test_images.cuda() if next_test_images is not None else None
+                test_paths = next_test_paths
                 if dataset.timed:
                     torch.cuda.synchronize()
                 frame_start = time.time()
@@ -492,8 +593,12 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                     gaussians.update_points_flow()
                 prev_frame_views = cur_frame_views
 
+        # pix_thresh_vals is only computed inside the frame_idx > 1 block; default None for frame 1
+        if frame_idx == 1:
+            pix_thresh_vals = None
+
         if enable_tqdm and frame_idx == 1:
-            progress_bar_iter = tqdm(range(first_iter, opt.iterations+1), 
+            progress_bar_iter = tqdm(range(first_iter, opt.iterations+1),
                                      desc="Frame iteration progress")
         else:
             progress_bar_iter = None
@@ -652,7 +757,8 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
             # ── [2] Motion estimation (flow / warp loss) ─────────────────────
             _t0 = _t_sync()
-            # Temporal flow consistency loss
+            # Flow loss is disabled in streaming mode (lambda_flow forced to 0.0
+            # because the next frame is not yet available when training the current one).
             if opt.lambda_flow>0.0 and iteration > (opt.flow_from_iter*opt.iterations):
                 if dataset.flow_loss_type == "render":
                     # Direct rendering approach for flow loss
@@ -922,29 +1028,37 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
 
         # Update previous frame's attributes and latents for next frame's residual encoding
-        if frame_idx != n_frames:
-            # Used for residual encoding of next frame
-            with torch.no_grad():
-                for att_name in gaussians.get_atts:
-                    prev_atts = gaussians.get_decoded_atts[att_name].clone()
-                    prev_latents = gaussians.get_atts[att_name].clone()
-                    gaussians.prev_atts[att_name] = prev_atts
-                    gaussians.prev_latents[att_name] = prev_latents
-                    gaussians.prev_atts[att_name].requires_grad_(False)
-                    gaussians.prev_latents[att_name].requires_grad_(False)
-                    gaussians.prev_atts_initial[att_name] = prev_atts.clone()
-            cur_frame_views = next_frame_views
-            cur_train_images = next_train_images
-            cur_train_paths = next_train_paths
-            prev_xyz = gaussians._xyz.clone()
+        with torch.no_grad():
+            for att_name in gaussians.get_atts:
+                prev_atts = gaussians.get_decoded_atts[att_name].clone()
+                prev_latents = gaussians.get_atts[att_name].clone()
+                gaussians.prev_atts[att_name] = prev_atts
+                gaussians.prev_latents[att_name] = prev_latents
+                gaussians.prev_atts[att_name].requires_grad_(False)
+                gaussians.prev_latents[att_name].requires_grad_(False)
+                gaussians.prev_atts_initial[att_name] = prev_atts.clone()
+        prev_xyz = gaussians._xyz.clone()
 
         if dataset.timed:
             torch.cuda.synchronize()
         frame_time += time.time()-frame_start
         frame_time_io += time.time()-frame_start
 
+        # video_decode_ms for this frame.
+        # decode_times_ms accumulates on every next_frame() call:
+        #   [0] = frame 1 (decoded before the loop, stored as _decode_ms_0)
+        #   [1] = frame 2 (decoded at loop top on first iteration)
+        #   [N-1] = frame N
+        if frame_idx == 1:
+            _this_decode_ms = _decode_ms_0
+        else:
+            _idx = frame_idx - 1   # frame 2 → index 1, frame 3 → index 2, ...
+            _this_decode_ms = (
+                train_stream.decode_times_ms[_idx]
+                if _idx < len(train_stream.decode_times_ms) else 0.0)
+
         # Collect frame metrics for logging
-        if test_image_dataset.n_cams > 0:
+        if has_test:
             frame_metrics = {
                 "Frame index": frame_idx,
                 "Loss": round(ema_loss_for_log,5),
@@ -956,6 +1070,7 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 "Size (MB)": round(cur_size,2),
                 "PSNR (Test)": round(metrics['test']['psnr'].item(),2),
                 "PSNR (Val)": round(metrics['val']['psnr'].item(),2),
+                "Video decode (ms)": round(_this_decode_ms, 2),
                 "Frame time": round(frame_time,2),
                 "Frame time IO": round(frame_time_io,2),
                 "Training time elapsed": round(net_elapsed_time,2),
@@ -971,16 +1086,16 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                                     if frame_idx>1 else f"{gaussians._xyz.shape[0]}",
                 "Size (MB)": round(cur_size,2),
                 "PSNR (Val)": round(metrics['val']['psnr'].item(),2),
+                "Video decode (ms)": round(_this_decode_ms, 2),
                 "Frame time": round(frame_time,2),
                 "Frame time IO": round(frame_time_io,2),
                 "Training time elapsed": round(net_elapsed_time,2),
             }
 
         training_metrics.append(frame_metrics)
-        
+
         # Log to wandb if enabled
         if wandb_enabled:
-            _frame_iters = max(_timing_count[k] for k in _timing_keys) or 1
             _latency_log = {
                 f"frame/latency/{k}_ms": round(_timing_accum[k] / _timing_count[k] * 1000, 3)
                 if _timing_count[k] > 0 else 0.0
@@ -1005,15 +1120,15 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 **_latency_log,
             })
 
-
         # Compute and display average metrics
-        if test_image_dataset.n_cams > 0:
+        if has_test:
             avg_metrics = {
                 "Loss (Test)": round(sum([fm["Loss (Test)"] for fm in training_metrics])/len(training_metrics),5),
                 "Loss (Val)": round(sum([fm["Loss (Val)"] for fm in training_metrics])/len(training_metrics),5),
                 "PSNR (Test)": round(sum([fm["PSNR (Test)"] for fm in training_metrics])/len(training_metrics),2),
                 "PSNR (Val)": round(sum([fm["PSNR (Val)"] for fm in training_metrics])/len(training_metrics),2),
                 "Size (MB)": round(sum([fm["Size (MB)"] for fm in training_metrics])),
+                "Video decode (ms)": round(sum([fm["Video decode (ms)"] for fm in training_metrics])/len(training_metrics),2),
                 "Frame time": round(sum([fm["Frame time"] for fm in training_metrics])/len(training_metrics),2),
                 "Elapsed time": round(frame_metrics["Training time elapsed"],2),
             }
@@ -1022,6 +1137,7 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 "Loss (Val)": round(sum([fm["Loss (Val)"] for fm in training_metrics])/len(training_metrics),5),
                 "PSNR (Val)": round(sum([fm["PSNR (Val)"] for fm in training_metrics])/len(training_metrics),2),
                 "Size (MB)": round(sum([fm["Size (MB)"] for fm in training_metrics])),
+                "Video decode (ms)": round(sum([fm["Video decode (ms)"] for fm in training_metrics])/len(training_metrics),2),
                 "Frame time": round(sum([fm["Frame time"] for fm in training_metrics])/len(training_metrics),2),
                 "Elapsed time": round(frame_metrics["Training time elapsed"],2),
             }
@@ -1035,8 +1151,24 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
             frame_counter += 1
             print(f"frame {frame_counter} frame_metrics: {frame_metrics}")
 
-        # End frame index loop
-          
+        # ── Advance to next frame or stop ─────────────────────────────────
+        if not have_next:
+            break
+        frame_idx += 1
+        # Move to GPU now that current frame training is done
+        next_train_images = next_train_images.cuda()
+        cur_frame_views  = next_train_images
+        cur_train_images = next_train_images
+        cur_train_paths  = next_train_paths
+
+    # End streaming loop
+
+    train_stream.release()
+    if has_test:
+        test_stream.release()
+    if enable_tqdm:
+        progress_bar_frame.close()
+
     with open(os.path.join(args.model_path,'training_metrics.json'),'w') as f:
         json.dump(training_metrics, f, indent=4)
 
@@ -1064,20 +1196,22 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     with open(os.path.join(args.model_path, 'timing_metrics.json'), 'w') as f:
         json.dump(timing_summary, f, indent=4)
 
-    if enable_tqdm:
-        progress_bar_frame.close()
-
     # Display final results
     print('\nFinal average training metrics:')
     for k,v in avg_metrics.items():
         print(k+":"+ str(v))
 
-    print('\nComponent latency summary (avg ms per iteration):')
-    _print_order = ["decode", "gaussian_selection", "render_forward",
+    print('\nComponent latency summary:')
+    _print_order = ["video_decode", "decode", "gaussian_selection", "render_forward",
                     "motion_estimation", "loss_backward", "optimizer_step", "densify_prune"]
     for key in _print_order:
         avg_ms = timing_summary[key].get("avg_ms", 0.0)
-        note = "  [= render_forward, decode is internal]" if key == "decode" else ""
+        if key == "video_decode":
+            note = "  [per frame, not per iteration]"
+        elif key == "decode":
+            note = "  [= render_forward, decode is internal]"
+        else:
+            note = ""
         print(f"  {key:25s}: {avg_ms:8.3f} ms{note}")
 
     # Log final metrics to wandb
@@ -1322,7 +1456,7 @@ if __name__ == "__main__":
     config = defaultdict(lambda: {}, config)
 
     # Set up command line argument parser
-    parser = ArgumentParser(description="Training script parameters")
+    parser = ArgumentParser(description="Streaming training script — MP4 frames decoded via OpenCV")
 
     lp = ModelParams(parser, config['model_params'])
     op_i = OptimizationParamsInitial(parser, config['opt_params_initial'])
@@ -1332,8 +1466,10 @@ if __name__ == "__main__":
 
     parser.add_argument('--config', type=str, default=None)
     parser.add_argument('--scene', type=str, default=None,
-                        help='Scene name (e.g. flame_steak). Derives source_path and model_path '
-                             'from streaming_params in the config file.')
+                        help='Scene name (e.g. flame_steak). Derives source_path, model_path, '
+                             'and video_dir from streaming_params in the config file.')
+    parser.add_argument('--video_dir', type=str, default=None,
+                        help='Directory containing cam*.mp4 files. Overrides --scene derived path.')
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
@@ -1342,20 +1478,26 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--save_format", type=str, default='ply')
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument('--use_xyz_legacy', action='store_true', default=False, help='If set, use legacy xyz decoding in GaussianModel (_xyz_legacy) to reproduce paper numbers. To save compressed pkl\'s, leave unset or set to False. Default: False (use _xyz_fixed).')
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[3_000, 7_000, 15_000, 30_000])
+    parser.add_argument("--start_checkpoint", type=str, default=None)
+    parser.add_argument('--use_xyz_legacy', action='store_true', default=False,
+                        help='Use legacy xyz decoding to reproduce paper numbers.')
     args = parser.parse_args(sys.argv[1:])
 
-    # Derive source_path and model_path from --scene if provided
+    # Derive source_path, model_path, video_dir from --scene if provided
     if args.scene is not None:
         sp = config.get('streaming_params', {})
         base_data = sp.get('base_data_dir', 'data/dynerf/n3dv')
         base_out = sp.get('base_output_dir', './output/streaming')
+        video_subdir = sp.get('base_video_subdir', 'videos')
         if not args.source_path:
             args.source_path = os.path.join(base_data, args.scene)
         if not args.model_path:
             args.model_path = os.path.join(base_out, args.scene)
+        if args.video_dir is None:
+            args.video_dir = os.path.join(base_data, args.scene, video_subdir)
+    elif args.video_dir is None:
+        parser.error('--video_dir is required when --scene is not specified')
 
     # Merge optimization args for initial and rest and change accordingly
     op = OptimizationParams(op_i.extract(args), op_r.extract(args))
@@ -1374,10 +1516,8 @@ if __name__ == "__main__":
         print('Error: must use xyz_fixed with log_compressed (do not use --use-xyz-legacy with --log_compressed)')
         sys.exit(1)
 
-    # Start GUI server, configure and run training
-    # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp_args, op, pp_args, qp_args, args.test_iterations, args.save_iterations, 
+    training(lp_args, op, pp_args, qp_args, args.test_iterations, args.save_iterations,
              args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args)
 
     # All done

@@ -138,9 +138,10 @@ class Scene:
             for idx,camera in enumerate(self.train_cameras[resolution_scale]):
                 image = train_image_data['image'][idx]
                 updateCam(args, image, train_image_data['path'][idx], frame_idx, camera, resolution_scale)
-            for idx,camera in enumerate(self.test_cameras[resolution_scale]):
-                image = test_image_data['image'][idx]
-                updateCam(args, image, test_image_data['path'][idx], frame_idx, camera, resolution_scale)
+            if test_image_data is not None and test_image_data.get('image') is not None:
+                for idx,camera in enumerate(self.test_cameras[resolution_scale]):
+                    image = test_image_data['image'][idx]
+                    updateCam(args, image, test_image_data['path'][idx], frame_idx, camera, resolution_scale)
 
     def resetCameraCache(self):
         for camera in self.getTrainCameras():

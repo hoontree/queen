@@ -39,3 +39,6 @@ libboost/
 eigen/
 logs/
 __pycache__
+wandb/
+*.egg-info/
+.claude/
