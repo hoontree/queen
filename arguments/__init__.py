@@ -99,6 +99,7 @@ class ModelParams(ParamGroup):
         self.sh_degree = 2
         self._source_path = ""
         self._model_path = ""
+        self.data_root = ""
         self._images = "images"
         self.img_fmt = "png"
         self._resolution = -1
@@ -128,7 +129,7 @@ class ModelParams(ParamGroup):
 
         self.wandb_project = "queen-dev"
         self.wandb_entity = "nvr-amri"
-        self.wandb_run_name = "test-run"
+        self.wandb_run_name = ""
         self.wandb_mode = "online"
         self.wandb_log_images = False
         self.wandb_tags = ""

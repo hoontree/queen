@@ -39,3 +39,8 @@ libboost/
 eigen/
 logs/
 __pycache__
+
+# build artifacts & local config
+wandb/
+*.egg-info/
+.claude/

@@ -14,6 +14,7 @@
 
 import os
 import sys
+import glob
 import torch
 import socket
 from random import randint, Random
@@ -42,8 +43,6 @@ from argparse import ArgumentParser, Namespace
 from utils.general_utils import DecayScheduler, kthvalue
 from utils.graphics_utils import adjust_depths
 from utils.image_utils import resize_image, downsample_image, blur_image, get_mask, write_depth, coords_grid, flow_warp, coords_grid_proj, get_depth, resize_dims
-from utils.loader_utils import MultiViewVideoDataset
-from utils.loader_utils import SequentialMultiviewSampler, MultiViewVideoDataset
 from arguments import ModelParams, PipelineParams, OptimizationParams, QuantizeParams, OptimizationParamsInitial, OptimizationParamsRest
 from scene.utils import get_depth_model, get_depth_poses
 from torchmetrics.functional.regression import pearson_corrcoef
@@ -57,6 +56,349 @@ enable_tqdm = True
 enable_debug = False
 
 EPS = 1.0e-7
+
+
+def cuda_with_latency(tensor, sync_cuda=False):
+    if sync_cuda and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    tic = time.perf_counter()
+    tensor = tensor.cuda()
+    if sync_cuda and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return tensor, time.perf_counter() - tic
+
+
+def copy_profile(profile):
+    return dict(profile) if profile else {}
+
+
+def round_profile(profile, ndigits=6):
+    rounded = {}
+    for key, value in profile.items():
+        if isinstance(value, float):
+            rounded[key] = round(value, ndigits)
+        elif isinstance(value, list):
+            rounded[key] = [round(v, ndigits) if isinstance(v, float) else v for v in value]
+        else:
+            rounded[key] = value
+    return rounded
+
+
+def summarize_load_profiles(train_profile, test_profile=None):
+    train_profile = train_profile or {}
+    test_profile = test_profile or {}
+    train_load_total = train_profile.get("total", 0.0)
+    train_cuda_total = train_profile.get("cuda_transfer", 0.0)
+    train_opencv_read_time = train_profile.get("opencv_read", 0.0)
+    train_opencv_convert_time = train_profile.get("opencv_convert", 0.0)
+    train_tensor_convert_time = train_profile.get("tensor_convert", 0.0)
+    train_stack_time = train_profile.get("stack", 0.0)
+    test_load_total = test_profile.get("total", 0.0)
+    test_cuda_total = test_profile.get("cuda_transfer", 0.0)
+    test_opencv_read_time = test_profile.get("opencv_read", 0.0)
+    test_opencv_convert_time = test_profile.get("opencv_convert", 0.0)
+    test_tensor_convert_time = test_profile.get("tensor_convert", 0.0)
+    test_stack_time = test_profile.get("stack", 0.0)
+    opencv_read_time = train_opencv_read_time + test_opencv_read_time
+    opencv_convert_time = train_opencv_convert_time + test_opencv_convert_time
+    tensor_convert_time = train_tensor_convert_time + test_tensor_convert_time
+    stack_time = train_stack_time + test_stack_time
+    cuda_transfer_time = train_cuda_total + test_cuda_total
+    data_loading_time = train_load_total + train_cuda_total + test_load_total + test_cuda_total
+    train_data_loading_time = train_load_total + train_cuda_total
+    return {
+        "data_loading_time": data_loading_time,
+        "train_data_loading_time": train_data_loading_time,
+        "opencv_frame_time": opencv_read_time + opencv_convert_time,
+        "opencv_read_time": opencv_read_time,
+        "opencv_convert_time": opencv_convert_time,
+        "tensor_convert_time": tensor_convert_time,
+        "stack_time": stack_time,
+        "cuda_transfer_time": cuda_transfer_time,
+    }
+
+
+def mean_metric(metrics, key, default=0.0):
+    values = [fm[key] for fm in metrics if key in fm]
+    if not values:
+        return default
+    return sum(values) / len(values)
+
+
+def build_latency_summary(metrics):
+    if not metrics:
+        return {
+            "num_frames": 0,
+            "frame_time": 0.0,
+            "train_data_loading_time": 0.0,
+            "opencv_read_time": 0.0,
+            "opencv_convert_time": 0.0,
+            "tensor_convert_time": 0.0,
+            "stack_time": 0.0,
+            "cuda_transfer_time": 0.0,
+            "e2e_latency": 0.0,
+        }
+    frame_time = mean_metric(metrics, "Frame time")
+    train_data_loading_time = mean_metric(metrics, "Train data loading time")
+    return {
+        "num_frames": len(metrics),
+        "frame_time": round(frame_time, 6),
+        "train_data_loading_time": round(train_data_loading_time, 6),
+        "opencv_read_time": round(mean_metric(metrics, "OpenCV read time"), 6),
+        "opencv_convert_time": round(mean_metric(metrics, "OpenCV convert time"), 6),
+        "tensor_convert_time": round(mean_metric(metrics, "Tensor convert time"), 6),
+        "stack_time": round(mean_metric(metrics, "Stack time"), 6),
+        "cuda_transfer_time": round(mean_metric(metrics, "CUDA transfer time"), 6),
+        "e2e_latency": round(frame_time + train_data_loading_time, 6),
+    }
+
+
+class OpenCVMultiViewVideoStream:
+    """Sequential multi-view frame reader backed by one video file per camera."""
+
+    VIDEO_EXTS = ("mp4", "mov", "avi", "mkv", "webm")
+
+    def __init__(
+        self,
+        datadir,
+        split,
+        test_indices,
+        max_frames=300,
+        start_idx=0,
+        video_filename="",
+        video_glob="",
+        video_dir="videos",
+        verbose=False,
+    ):
+        self.datadir = datadir
+        self.split = split
+        self.test_indices = set(test_indices)
+        self.max_frames = max_frames
+        self.start_idx = start_idx
+        self.video_filename = video_filename
+        self.video_glob = video_glob
+        self.video_dir = video_dir
+        self.verbose = verbose
+        self.frame_idx = 0
+        self.caps = []
+        self.video_paths = []
+        self.fake_image_paths = []
+        self.n_cams = 0
+        self.n_frames = None
+        self.last_profile = {}
+
+        camera_sources = self._discover_camera_sources(datadir)
+        for cam_idx, camera_source in enumerate(camera_sources):
+            is_test = cam_idx in self.test_indices
+            if (split == "test" and not is_test) or (split == "train" and is_test):
+                continue
+
+            cam_dir = camera_source["cam_dir"]
+            video_path = camera_source["video_path"] or self._resolve_video_path(cam_dir)
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                raise RuntimeError(f"Could not open video file: {video_path}")
+
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if width <= 0 or height <= 0:
+                cap.release()
+                raise RuntimeError(f"Could not read video dimensions: {video_path}")
+
+            if self.n_frames is None:
+                self.width = width
+                self.height = height
+                available_frames = self._usable_frame_count(video_path, frame_count)
+                self.n_frames = available_frames
+            else:
+                if width != self.width or height != self.height:
+                    cap.release()
+                    raise RuntimeError(
+                        f"All videos in a split must have the same resolution. "
+                        f"Expected {self.width}x{self.height}, got {width}x{height} for {video_path}"
+                    )
+                self.n_frames = min(self.n_frames, self._usable_frame_count(video_path, frame_count))
+
+            self._seek_to_start(cap, video_path)
+            self.caps.append(cap)
+            self.video_paths.append(video_path)
+            self.fake_image_paths.append(os.path.join(cam_dir, "images", "{frame:04d}.png"))
+            self.n_cams += 1
+
+        if self.n_cams == 0:
+            self.n_frames = 0
+        elif max_frames and max_frames > 0:
+            self.n_frames = min(self.n_frames, max_frames)
+
+        if verbose:
+            print(
+                f"OpenCVMultiViewVideoStream::__init__(): split={split}, "
+                f"n_cams={self.n_cams}, n_frames={self.n_frames}"
+            )
+
+    def _discover_camera_sources(self, datadir):
+        video_root = self.video_dir
+        if video_root and not os.path.isabs(video_root):
+            video_root = os.path.join(datadir, video_root)
+
+        if video_root and os.path.isdir(video_root):
+            candidates = []
+            if self.video_glob:
+                candidates = sorted(glob.glob(os.path.join(video_root, self.video_glob)))
+            elif self.video_filename:
+                for cam_name in self._metadata_camera_names(datadir) or []:
+                    candidate = os.path.join(video_root, f"{cam_name}{os.path.splitext(self.video_filename)[1]}")
+                    if os.path.exists(candidate):
+                        candidates.append(candidate)
+                if not candidates:
+                    candidates = sorted(glob.glob(os.path.join(video_root, self.video_filename)))
+            else:
+                for ext in self.VIDEO_EXTS:
+                    candidates.extend(sorted(glob.glob(os.path.join(video_root, f"cam*.{ext}"))))
+                    candidates.extend(sorted(glob.glob(os.path.join(video_root, f"camera_*.{ext}"))))
+                candidates = sorted(set(candidates))
+
+            if candidates:
+                return [
+                    {
+                        "name": os.path.splitext(os.path.basename(video_path))[0],
+                        "cam_dir": os.path.join(datadir, os.path.splitext(os.path.basename(video_path))[0]),
+                        "video_path": video_path,
+                    }
+                    for video_path in candidates
+                ]
+
+        camera_dirs = sorted(glob.glob(os.path.join(datadir, "cam*")))
+        if os.path.exists(os.path.join(datadir, "models.json")):
+            with open(os.path.join(datadir, "models.json"), "r") as f:
+                meta = json.load(f)
+            camera_names_meta = [camera["name"] for camera in meta]
+            filtered_dirs = []
+            for cam_dir in camera_dirs:
+                if os.path.basename(cam_dir) in camera_names_meta:
+                    filtered_dirs.append(cam_dir)
+            camera_dirs = sorted(filtered_dirs)
+        return [
+            {
+                "name": os.path.basename(cam_dir),
+                "cam_dir": cam_dir,
+                "video_path": None,
+            }
+            for cam_dir in camera_dirs
+        ]
+
+    def _metadata_camera_names(self, datadir):
+        if not os.path.exists(os.path.join(datadir, "models.json")):
+            return None
+        with open(os.path.join(datadir, "models.json"), "r") as f:
+            meta = json.load(f)
+        return [camera["name"] for camera in meta]
+
+    def _resolve_video_path(self, cam_dir):
+        if self.video_filename:
+            video_path = self.video_filename
+            if not os.path.isabs(video_path):
+                video_path = os.path.join(cam_dir, video_path)
+            if not os.path.exists(video_path):
+                raise FileNotFoundError(f"Video file does not exist: {video_path}")
+            return video_path
+
+        if self.video_glob:
+            candidates = sorted(glob.glob(os.path.join(cam_dir, self.video_glob)))
+        else:
+            candidates = []
+            for ext in self.VIDEO_EXTS:
+                candidates.extend(sorted(glob.glob(os.path.join(cam_dir, f"*.{ext}"))))
+
+        if not candidates:
+            raise FileNotFoundError(
+                f"No video file found in {cam_dir}. Use --video_filename or --video_glob."
+            )
+        if len(candidates) > 1:
+            raise RuntimeError(
+                f"Multiple video files found in {cam_dir}: {candidates}. "
+                "Use --video_filename or --video_glob to select one."
+            )
+        return candidates[0]
+
+    def _usable_frame_count(self, video_path, frame_count):
+        if frame_count <= 0:
+            if self.max_frames and self.max_frames > 0:
+                return self.max_frames
+            raise RuntimeError(
+                f"Video frame count is unavailable for {video_path}; set --max_frames explicitly."
+            )
+        usable = frame_count - self.start_idx
+        if usable <= 0:
+            raise RuntimeError(
+                f"start_idx={self.start_idx} is outside the video range for {video_path} "
+                f"(frame_count={frame_count})."
+            )
+        return usable
+
+    def _seek_to_start(self, cap, video_path):
+        if self.start_idx <= 0:
+            return
+        if cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_idx):
+            return
+        for _ in range(self.start_idx):
+            ok, _ = cap.read()
+            if not ok:
+                raise RuntimeError(f"Could not seek to frame {self.start_idx} in {video_path}")
+
+    def next_frame(self):
+        if self.frame_idx >= self.n_frames:
+            raise StopIteration
+
+        total_start = time.perf_counter()
+        frame_tensors = []
+        frame_paths = []
+        source_frame_idx = self.start_idx + self.frame_idx
+        read_time = 0.0
+        convert_time = 0.0
+        tensor_time = 0.0
+        per_camera_read_time = []
+        for cap, video_path, path_template in zip(self.caps, self.video_paths, self.fake_image_paths):
+            tic = time.perf_counter()
+            ok, frame_bgr = cap.read()
+            cur_read_time = time.perf_counter() - tic
+            read_time += cur_read_time
+            per_camera_read_time.append(cur_read_time)
+            if not ok:
+                raise StopIteration
+
+            tic = time.perf_counter()
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            convert_time += time.perf_counter() - tic
+
+            tic = time.perf_counter()
+            frame_tensor = torch.from_numpy(np.ascontiguousarray(frame_rgb)).permute(2, 0, 1).float() / 255.0
+            tensor_time += time.perf_counter() - tic
+            frame_tensors.append(frame_tensor)
+            frame_paths.append(path_template.format(frame=source_frame_idx))
+
+        tic = time.perf_counter()
+        images = torch.stack(frame_tensors, dim=0)
+        stack_time = time.perf_counter() - tic
+        total_time = time.perf_counter() - total_start
+        self.last_profile = {
+            "frame_idx": source_frame_idx,
+            "total": total_time,
+            "opencv_read": read_time,
+            "opencv_convert": convert_time,
+            "tensor_convert": tensor_time,
+            "stack": stack_time,
+            "n_cams": self.n_cams,
+            "per_camera_read": per_camera_read_time,
+            "cuda_transfer": 0.0,
+        }
+        self.frame_idx += 1
+        return images, frame_paths
+
+    def close(self):
+        for cap in self.caps:
+            cap.release()
 try:
     from torch.utils.tensorboard import SummaryWriter
     if not ('SLURM_PROCID' in os.environ and os.environ['SLURM_PROCID']!='0'):
@@ -75,43 +417,7 @@ try:
 except ImportError:
     WANDB_FOUND = False
 
-
-def _sync_cuda(enabled):
-    """torch.cuda.synchronize() guarded by a flag and CUDA availability."""
-    if enabled and torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-
-def next_batch_with_latency(loader, sync_cuda=False):
-    """Pull one batch from a DataLoader and move it to CUDA, returning the wall
-    time spent. With num_workers=0 (timed mode) this includes the actual RGB
-    decode (PIL.Image.open + ToTensor) since it runs synchronously in-process.
-    Returns (images_cuda, paths, elapsed_seconds)."""
-    _sync_cuda(sync_cuda)
-    t0 = time.perf_counter()
-    images, paths = next(loader)
-    images = images.cuda()
-    _sync_cuda(sync_cuda)
-    return images, paths, time.perf_counter() - t0
-
-
-def _latency_stats(values):
-    """count/mean/std/min/max for a list of per-frame latencies (seconds)."""
-    n = len(values)
-    if n == 0:
-        return {"count": 0, "mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
-    mean = sum(values) / n
-    var = sum((v - mean) ** 2 for v in values) / n
-    return {
-        "count": n,
-        "mean": round(mean, 6),
-        "std": round(var ** 0.5, 6),
-        "min": round(min(values), 6),
-        "max": round(max(values), 6),
-    }
-
-
-def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams, qp:QuantizeParams, testing_iterations: list,
+def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams, qp:QuantizeParams, testing_iterations: list, 
              saving_iterations: list, checkpoint_iterations, checkpoint: str, debug_from, args):
     """Main training function for QUEEN compressed Gaussian splatting."""
     wandb_enabled = WANDB_FOUND and dataset.use_wandb
@@ -121,25 +427,42 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
     qp.use_shift = [bool(el) for el in qp.use_shift]
 
-    # Create dataset and loader for training and testing at each time instance
-    train_image_dataset = MultiViewVideoDataset(dataset.source_path, split='train', test_indices=dataset.test_indices,
-                                                max_frames=dataset.max_frames, start_idx=dataset.start_idx, img_format=dataset.img_fmt)
-    test_image_dataset = MultiViewVideoDataset(dataset.source_path, split='test', test_indices=dataset.test_indices, 
-                                               max_frames=dataset.max_frames, start_idx=dataset.start_idx, 
-                                               img_format=dataset.img_fmt)
-
-    train_sampler = SequentialMultiviewSampler(train_image_dataset)
-    if test_image_dataset.n_cams > 0:
-        test_sampler = SequentialMultiviewSampler(test_image_dataset)
-
-    # Under timed mode use num_workers=0 so PNG decode runs synchronously in-process
-    # and is captured inside the decode-timing region (background workers would hide it).
-    loader_workers = 0 if dataset.timed else 4
-    train_loader = iter(torch.utils.data.DataLoader(train_image_dataset, batch_size=train_image_dataset.n_cams,
-                                                    sampler=train_sampler, num_workers=loader_workers))
-    if test_image_dataset.n_cams > 0:
-        test_loader = iter(torch.utils.data.DataLoader(test_image_dataset, batch_size=test_image_dataset.n_cams,
-                                                        sampler=test_sampler, num_workers=loader_workers))
+    # Create OpenCV-backed sequential readers for training and testing.
+    # Each next_frame() call returns all camera views for the same timestamp as
+    # a (N, C, H, W) tensor, matching the batch shape previously produced by DataLoader.
+    train_reader = OpenCVMultiViewVideoStream(
+        dataset.source_path,
+        split='train',
+        test_indices=dataset.test_indices,
+        max_frames=dataset.max_frames,
+        start_idx=dataset.start_idx,
+        video_filename=getattr(dataset, "video_filename", ""),
+        video_glob=getattr(dataset, "video_glob", ""),
+        video_dir=getattr(dataset, "video_dir", "videos"),
+    )
+    test_reader = OpenCVMultiViewVideoStream(
+        dataset.source_path,
+        split='test',
+        test_indices=dataset.test_indices,
+        max_frames=dataset.max_frames,
+        start_idx=dataset.start_idx,
+        video_filename=getattr(dataset, "video_filename", ""),
+        video_glob=getattr(dataset, "video_glob", ""),
+        video_dir=getattr(dataset, "video_dir", "videos"),
+    )
+    if test_reader.n_cams > 0:
+        common_n_frames = min(train_reader.n_frames, test_reader.n_frames)
+        if common_n_frames != train_reader.n_frames or common_n_frames != test_reader.n_frames:
+            print(
+                f"training(): train/test video lengths differ; using {common_n_frames} synced frames "
+                f"(train={train_reader.n_frames}, test={test_reader.n_frames})"
+            )
+        train_reader.n_frames = common_n_frames
+        test_reader.n_frames = common_n_frames
+    if train_reader.n_cams == 0:
+        raise RuntimeError("No training camera videos found. Check source_path, test_indices, and video selection options.")
+    if train_reader.n_frames == 0:
+        raise RuntimeError("No training frames available after applying start_idx/max_frames.")
     
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     print(f"training(): dataset.white_background set to {dataset.white_background}")
@@ -149,40 +472,43 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     # Initial set of images to initialize camera and camera parameters
     # Image dimensions should remain constant throughout the video
     print(f"training(): loading data for the first frame...")
+    startup_start = time.perf_counter()
     tic = time.time()
-    # Decode time (frame 1): make the first frame's training-view RGBs available on GPU.
-    # Test-view decode is evaluation overhead and is excluded from the decode bucket.
-    train_images, train_paths, frame1_decode_time = next_batch_with_latency(train_loader, sync_cuda=dataset.timed)
+    train_images, train_paths = train_reader.next_frame()  # train_images: (N, C, H, W)
+    cur_train_load_profile = copy_profile(train_reader.last_profile)
+    train_images, cur_train_cuda_time = cuda_with_latency(train_images, sync_cuda=dataset.timed)
+    cur_train_load_profile["cuda_transfer"] = cur_train_cuda_time
 
-    if test_image_dataset.n_cams > 0:
-        test_images, test_paths, _ = next_batch_with_latency(test_loader, sync_cuda=dataset.timed)
+    if test_reader.n_cams > 0:
+        test_images, test_paths = test_reader.next_frame()
+        cur_test_load_profile = copy_profile(test_reader.last_profile)
+        test_images, cur_test_cuda_time = cuda_with_latency(test_images, sync_cuda=dataset.timed)
+        cur_test_load_profile["cuda_transfer"] = cur_test_cuda_time
         test_image_data = {'image':test_images,'path':test_paths,'frame_idx':0}
     else:
         print('No test cameras found, disabling testing.')
         test_images, test_paths = None, None
+        cur_test_load_profile = {}
         test_image_data = {'image':None,'path':None,'frame_idx':0}
 
     train_image_data = {'image':train_images,'path':train_paths,'frame_idx':0}
-
+    first_frame_load_profile = {
+        "train": round_profile(cur_train_load_profile),
+        "test": round_profile(cur_test_load_profile),
+        **{
+            key: round(value, 6)
+            for key, value in summarize_load_profiles(cur_train_load_profile, cur_test_load_profile).items()
+        },
+    }
+    first_frame_load_profile["wall_time"] = round(time.time() - tic, 6)
+    
     print(f"training(): data loaded in {float(time.time() - tic):.2f} sec")
 
-    # Resume frame 1 from a prebuilt .ply (skips the static 3DGS training below).
-    if checkpoint is not None:
-        if not (isinstance(checkpoint, str) and checkpoint.endswith(".ply")):
-            raise ValueError(f"--start_checkpoint must be a .ply file, got: {checkpoint}")
-        if not os.path.exists(checkpoint):
-            raise FileNotFoundError(f"--start_checkpoint not found: {checkpoint}")
-        print(f"training(): resuming frame 1 from checkpoint ply: {checkpoint}")
-
-    # Static 3DGS initialization (frame 1, one-time). Reported in the dedicated
-    # initialization table and excluded from steady-state per-frame latency.
-    # When resuming from a checkpoint, this region instead measures the ply-load time.
-    _sync_cuda(dataset.timed)
-    static_init_start = time.time()
     # Create the gaussian model and scene, initialized with frame 1 images from dataset
     gaussians = GaussianModel(dataset.sh_degree, qp, dataset, use_xyz_legacy=args.use_xyz_legacy)
 
-    max_frames = args.max_frames
+    max_frames = train_reader.n_frames
+    scene_init_start = time.perf_counter()
     scene = Scene(
         dataset,
         gaussians,
@@ -190,20 +516,16 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         test_image_data=test_image_data,
         N_video_views=max_frames
     )
-    if checkpoint is not None:
-        # Overwrite the create_from_pcd init with the prebuilt frame-1 Gaussian.
-        gaussians.load_ply(checkpoint)
-    # Setup training arguments (rebuilds the optimizer over the loaded params)
+    scene_init_time = time.perf_counter() - scene_init_start
+    # Setup training arguments
     gaussians.training_setup(opt)
-    _sync_cuda(dataset.timed)
-    static_init_time = time.time() - static_init_start
 
     # Spiral cameras
     video_cameras = scene.getVideoCameras()
 
     # Metadata used by various components
     train_cameras = scene.getTrainCameras()
-    n_frames, n_cams = train_image_dataset.n_frames, train_image_dataset.n_cams
+    n_frames, n_cams = train_reader.n_frames, train_reader.n_cams
     print(f"training(): running with {n_frames} frames from {n_cams} cameras")
     opt.iterations = opt.epochs*n_cams
     print(f"training(): opt.iterations set to {opt.iterations}")
@@ -213,8 +535,9 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     prev_frame_views = cur_frame_views
 
     # Vary number of iterations based on frame difference in json file
-    if dataset.adaptive_iters and n_frames>1:
-        frame_diff = json.load(open(os.path.join(dataset.source_path,'frame_diff.json'),'r'))['l2']
+    frame_diff_path = os.path.join(dataset.source_path, 'frame_diff.json')
+    if dataset.adaptive_iters and n_frames>1 and os.path.exists(frame_diff_path):
+        frame_diff = json.load(open(frame_diff_path,'r'))['l2']
         frame_diff = np.array(frame_diff[:n_frames-1])
         epochs_rest = opt.opt_rest['epochs_rest']
         mult = np.clip(frame_diff/frame_diff.mean(),1/4,4) # between 0.25 to 4
@@ -222,9 +545,12 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         frame_epochs = np.ceil((mult*epochs_rest)).astype(np.int32)
         frame_iters = np.concatenate((np.array([opt.iterations]),frame_epochs*n_cams))
     else:
+        if dataset.adaptive_iters and n_frames>1:
+            print(f"training(): adaptive_iters requested but {frame_diff_path} was not found; using fixed frame iterations.")
         frame_iters = np.array([opt.iterations]+[opt.opt_rest['epochs_rest']*n_cams]*(n_frames-1))
-    # Depth supervision/init is frame-1-training-only; skip it when resuming from a checkpoint.
-    if (opt.lambda_depth>0.0 or dataset.depth_init) and checkpoint is None:
+    depth_init_time = 0.0
+    if opt.lambda_depth>0.0 or dataset.depth_init:
+        depth_init_start = time.perf_counter()
 
         ## MiDas model for monocular depth estimation
         depth_model, transform, net_w, net_h = get_depth_model(dataset)
@@ -252,6 +578,17 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         depth_loss_fn = DepthRelLoss(camera.original_image.shape[1], camera.original_image.shape[2],
                                      pix_diff=dataset.depth_pix_range, num_comp=dataset.depth_num_comp, 
                                      tolerance=dataset.depth_tolerance)
+        if dataset.timed and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        depth_init_time = time.perf_counter() - depth_init_start
+
+    startup_profile = {
+        "first_frame_load_time": first_frame_load_profile["train_data_loading_time"],
+        "first_frame_load_wall_time": first_frame_load_profile["wall_time"],
+        "scene_init_time": round(scene_init_time, 6),
+        "depth_init_time": round(depth_init_time, 6),
+        "total_startup_time": round(time.perf_counter() - startup_start, 6),
+    }
 
     # Progressive training scheduler - OBSOLETE: Remove in future cleanup
     resize_scale_sched = DecayScheduler(
@@ -266,20 +603,11 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     net_elapsed_time = 0.0
     net_iter_time = 0.0
 
-    # Per-stage timing (seconds, accumulated per frame). Training render is separate
-    # from rendering used for validation/output so FPS excludes loss render time.
-    # "heldout_render" is the dedicated latency render of G_t into one held-out view.
+    # Per-stage timing (seconds, accumulated per frame) for training pipeline breakdown.
+    # Data loading and output rendering are logged as top-level streaming metrics.
     STAGE_NAMES = ["initialization", "motion_estimation", "gaussian_selection",
                    "train_render_forward", "loss_backward", "optimizer_step",
-                   "densify_prune", "rendering", "heldout_render"]
-
-    # Stages that constitute the method's per-frame "update" (reconstruction) latency:
-    # everything from "frames available" to "G_t ready". Excludes decode, validation/
-    # spiral renders, the held-out latency render, saving, and the first-frame static init.
-    UPDATE_STAGES = ["motion_estimation", "gaussian_selection",
-                     "train_render_forward", "loss_backward", "optimizer_step",
-                     "densify_prune"]
-    LATENCY_FIELDS = ["Decode time", "Update time", "Render time (heldout)", "E2E time"]
+                   "densify_prune"]
 
     class StageTimer:
         def __init__(self, sync):
@@ -321,22 +649,20 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         wandb.define_metric("frame/update_points", step_metric="frame_idx")
         wandb.define_metric("frame/iter_time", step_metric="frame_idx")
         wandb.define_metric("frame/iter_time_io", step_metric="frame_idx")
+        wandb.define_metric("frame/data_loading_time", step_metric="frame_idx")
+        wandb.define_metric("frame/opencv_read_time", step_metric="frame_idx")
+        wandb.define_metric("frame/opencv_convert_time", step_metric="frame_idx")
+        wandb.define_metric("frame/tensor_convert_time", step_metric="frame_idx")
+        wandb.define_metric("frame/train_data_loading_time", step_metric="frame_idx")
+        wandb.define_metric("frame/cuda_transfer_time", step_metric="frame_idx")
         wandb.define_metric("frame/rendering_time", step_metric="frame_idx")
         wandb.define_metric("frame/rendering_frames", step_metric="frame_idx")
         wandb.define_metric("frame/rendering_fps", step_metric="frame_idx")
         wandb.define_metric("frame/elapsed", step_metric="frame_idx")
         for _stage in STAGE_NAMES:
             wandb.define_metric(f"frame/stage_time/{_stage}", step_metric="frame_idx")
-        for _lat in ["decode", "update", "render", "e2e"]:
-            wandb.define_metric(f"frame/latency/{_lat}", step_metric="frame_idx")
 
-    if opt.lambda_flow > 0.0:
-        grid = coords_grid(1,H,W, device='cuda')
-
-    # Train-decode latency of the current frame. Frame 1 is decoded at the top; each
-    # later frame's train data is prefetched during the previous iteration, so its
-    # measured decode cost is carried over here to the frame it belongs to.
-    pending_train_decode_time = frame1_decode_time
+    grid = coords_grid(1,H,W, device='cuda')
 
     if enable_tqdm:
         progress_bar_frame = tqdm(range(1, n_frames+1), desc="Training progress")
@@ -386,22 +712,26 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         initialization_start = time.time() if frame_idx == 1 else None
         rendering_frames = 0
 
-        # Decode latency of the current frame's training views (carried over from the
-        # previous iteration's prefetch; for frame 1 set from the top-level decode).
-        decode_time = pending_train_decode_time
-
-        try:
-            # Pre-load data for next frame (this measures the NEXT frame's train decode)
-            next_train_images, next_train_paths, pending_train_decode_time = next_batch_with_latency(
-                train_loader, sync_cuda=dataset.timed)
+        has_next_frame = True
+        next_train_load_profile = {}
+        try: 
+            # Pre-load data for next frame
+            next_train_images, next_train_paths = train_reader.next_frame()
+            next_train_load_profile = copy_profile(train_reader.last_profile)
+            next_train_images, next_train_cuda_time = cuda_with_latency(next_train_images, sync_cuda=dataset.timed)
+            next_train_load_profile["cuda_transfer"] = next_train_cuda_time
             next_frame_views = next_train_images
 
             orig_size = cur_frame_views.shape[-2:]
             rescaled_size = resize_dims(orig_size, dataset.flow_scale)
 
         except StopIteration:
-            assert frame_idx == n_frames
-            pending_train_decode_time = 0.0
+            if frame_idx != n_frames:
+                raise RuntimeError(
+                    f"Training video stream ended before expected frame {frame_idx + 1}. "
+                    f"Check video frame counts and decode errors."
+                )
+            has_next_frame = False
             opt.lambda_flow = 0.0
 
         if dataset.timed:
@@ -420,7 +750,7 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 denom = torch.zeros(gaussians.get_xyz.shape[0],1).to(gaussians._xyz)
                 gaussians.optimizer.zero_grad(set_to_none=True)
                 for cam_idx, camera in enumerate(train_cameras):
-                    render_pkg = render_mask(camera, gaussians, pipe, bg, image_shape=camera.original_image.shape)
+                    render_pkg = render_mask(camera, gaussians, pipe, bg, image_shape=gt_image.shape)
                     camera.prev_rendered = render_pkg["render"].detach()
                     image, viewspace_point_tensor = render_pkg["render"], render_pkg["viewspace_points"]
                     visibility_filter = render_pkg["visibility_filter"]
@@ -471,41 +801,43 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 opt.set_params(frame_idx)
                 opt.iterations = frame_iters[frame_idx-1]
                 opt.epochs = (opt.iterations//n_cams)
+                if not has_next_frame:
+                    opt.lambda_flow = 0.0
                 gaussians.frame_idx = frame_idx
-                # Residual/optimizer setup is part of the per-frame update (residual learning).
-                stage_timer.start("gaussian_selection")
                 # Create decoder and latents for quantized residuals if first time
                 # Else reset latent values to 0
                 gaussians.update_residuals()
                 # Redefine the optimizer and other tracked variables for the gaussian model
                 gaussians.training_setup(opt)
-                stage_timer.stop()  # residual/optimizer setup (folded into gaussian_selection)
                 # Load the current test data (Preloaded data for next frame is only for training)
                 train_images, train_paths = cur_train_images, cur_train_paths
                 if dataset.timed:
                     torch.cuda.synchronize()
                 frame_time += time.time() - frame_start
-                if test_image_dataset.n_cams > 0:
-                    test_data = next(test_loader)
-                    test_images, test_paths = test_data[0].cuda(), test_data[1]
+                if test_reader.n_cams > 0:
+                    try:
+                        test_images, test_paths = test_reader.next_frame()
+                        cur_test_load_profile = copy_profile(test_reader.last_profile)
+                    except StopIteration as exc:
+                        raise RuntimeError(
+                            f"Test video stream ended before expected frame {frame_idx}. "
+                            f"Check train/test video frame counts and decode errors."
+                        ) from exc
+                    test_images, cur_test_cuda_time = cuda_with_latency(test_images, sync_cuda=dataset.timed)
+                    cur_test_load_profile["cuda_transfer"] = cur_test_cuda_time
                 else:
                     if frame_idx == start_frame_idx:
                         print('No test cameras found, disabling testing.')
                     test_images, test_paths = None, None
+                    cur_test_load_profile = {}
                 if dataset.timed:
                     torch.cuda.synchronize()
                 frame_start = time.time()
                 train_image_data = {'image':train_images,'path':train_paths}
                 test_image_data = {'image':test_images,'path':test_paths}
             
-                # Update the images and paths for all cameras in the scene with new frame index.
-                # Binding the decoded tensors into camera objects makes the frame available to
-                # the model, so its cost is folded into decode_time.
-                _sync_cuda(dataset.timed)
-                _bind_t0 = time.time()
+                # Update the images and paths for all cameras in the scene with new frame index
                 scene.updateCameraImages(args, train_image_data, test_image_data, frame_idx, resolution_scales=[1.0])
-                _sync_cuda(dataset.timed)
-                decode_time += time.time() - _bind_t0
                 train_cameras = scene.getTrainCameras()
 
                 # If using a frame difference or 2d flow mask for gate initialization and adaptive masked training
@@ -601,16 +933,13 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                         gaussians.gate_atts.reset_params(init_probs=gaussians.init_probs)
                         gaussians.gate_atts.train()
 
-                if dataset.flow_update and opt.lambda_flow>0.0:
+                if has_next_frame and dataset.flow_update and opt.lambda_flow>0.0:
                     gaussians.update_points_flow()
                 prev_frame_views = cur_frame_views
             stage_timer.stop()  # end gaussian_selection
 
-        # When resuming frame 1 from a checkpoint, skip the static training loop entirely.
-        load_checkpoint = (frame_idx == 1 and checkpoint is not None)
-
-        if enable_tqdm and frame_idx == 1 and not load_checkpoint:
-            progress_bar_iter = tqdm(range(first_iter, opt.iterations+1),
+        if enable_tqdm and frame_idx == 1:
+            progress_bar_iter = tqdm(range(first_iter, opt.iterations+1), 
                                      desc="Frame iteration progress")
         else:
             progress_bar_iter = None
@@ -622,29 +951,8 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         frame_time_io += time.time() - frame_start_io
         frame_start_io = time.time()
 
-        # Frame 1 loaded from checkpoint: run a single eval pass (no optimization) so the
-        # frame-1 PSNR/metrics are reported. The eval render counts as evaluation overhead
-        # (the "rendering" stage), not as update latency.
-        if load_checkpoint:
-            net_elapsed_time = time.time() - training_start
-            cur_size = gaussians.size()/8/(10**6)
-            _dummy = torch.zeros(1, device="cuda")
-            report = training_report(tb_writer, wandb_enabled, dataset, frame_idx, opt.iterations,
-                                     _dummy, _dummy, l1_loss, cur_size, frame_time, True, scene,
-                                     render_mask, (pipe, background), prev_report=None,
-                                     report_alpha=True, max_iterations=opt.iterations)
-            if report:
-                stage_timer.totals["rendering"] += report.get("_render_time", 0.0)
-                rendering_frames += report.get("_render_count", 0)
-                report_configs = ['test', 'val'] if 'test' in report.keys() else ['val']
-                for config_name in report_configs:
-                    metrics[config_name]['psnr'] = report[config_name]['psnr']
-                    metrics[config_name]['loss'] = report[config_name]['l1']
-                best_psnr = max(best_psnr, metrics['test']['psnr'])
-
-        # Start training iteration loop for current frame (skipped when loading from checkpoint)
-        loop_iters = 0 if load_checkpoint else opt.iterations
-        for iteration in range(first_iter, loop_iters + 1):
+        # Start training iteration loop for current frame
+        for iteration in range(first_iter, opt.iterations + 1):        
 
             if enable_debug:
                 print(f"DEBUG: started iteration {iteration}")
@@ -743,7 +1051,7 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
             render_pkg = render_mask(viewpoint_cam, gaussians, pipe, bg, image_shape=gt_image.shape,
                                      color_mask=color_rw_mask, render_depth=opt.lambda_depth>0.0,
                                      backward_alpha=opt.lambda_alpha>0.0,
-                                     render_flow=opt.lambda_flow>0.0 and iteration > (opt.flow_from_iter*opt.iterations),
+                                     render_flow=has_next_frame and opt.lambda_flow>0.0 and iteration > (opt.flow_from_iter*opt.iterations),
                                      pixel_mask=pixel_mask,
                                      update_mask=None)
 
@@ -786,7 +1094,7 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 loss += opt.lambda_alpha * l2_loss(render_pkg["alpha"],1.0)
 
             # Temporal flow consistency loss
-            if opt.lambda_flow>0.0 and iteration > (opt.flow_from_iter*opt.iterations):
+            if has_next_frame and opt.lambda_flow>0.0 and iteration > (opt.flow_from_iter*opt.iterations):
                 if dataset.flow_loss_type == "render":
                     # Direct rendering approach for flow loss
                     render_pkg_flow = render_mask_shift(viewpoint_cam, gaussians, pipe, bg, image_shape=gt_image.shape)
@@ -1028,20 +1336,6 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                     print(f'DEBUG ({iteration}): Optimizer step done')
         # end training loop for this frame
 
-        # Render latency: rasterize the updated G_t into ONE held-out test view.
-        # PSNR/SSIM/LPIPS are intentionally excluded (evaluation overhead, not latency).
-        # The trailing synchronize() in stage_timer.stop() also serves as the E2E final sync.
-        if test_image_dataset.n_cams > 0:
-            heldout_cam = scene.getTestCameras()[0]
-            with torch.no_grad():
-                stage_timer.start("heldout_render")
-                _ = render_mask(heldout_cam, gaussians, pipe, background,
-                                image_shape=heldout_cam.original_image.shape)["render"]
-                stage_timer.stop()
-        elif frame_idx == start_frame_idx:
-            print('No test cameras found; held-out render time will be 0.0 (requires a held-out view).')
-        render_time = stage_timer.totals.get("heldout_render", 0.0)
-
         if dataset.timed:
             torch.cuda.synchronize()
         frame_start = time.time()
@@ -1070,6 +1364,8 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
 
         # Update previous frame's attributes and latents for next frame's residual encoding
+        frame_train_load_profile = copy_profile(cur_train_load_profile)
+        frame_test_load_profile = copy_profile(cur_test_load_profile)
         if frame_idx != n_frames:
             # Used for residual encoding of next frame
             with torch.no_grad():
@@ -1084,6 +1380,7 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
             cur_frame_views = next_frame_views
             cur_train_images = next_train_images
             cur_train_paths = next_train_paths
+            cur_train_load_profile = next_train_load_profile
             prev_xyz = gaussians._xyz.clone()
 
         if dataset.timed:
@@ -1095,23 +1392,21 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
             if dataset.timed:
                 torch.cuda.synchronize()
             stage_timer.totals["initialization"] = time.time() - initialization_start
+        load_summary = summarize_load_profiles(frame_train_load_profile, frame_test_load_profile)
+        data_loading_time = load_summary["data_loading_time"]
+        train_data_loading_time = load_summary["train_data_loading_time"]
+        opencv_frame_time = load_summary["opencv_frame_time"]
+        opencv_read_time = load_summary["opencv_read_time"]
+        opencv_convert_time = load_summary["opencv_convert_time"]
+        tensor_convert_time = load_summary["tensor_convert_time"]
+        stack_time = load_summary["stack_time"]
+        cuda_transfer_time = load_summary["cuda_transfer_time"]
         stage_times = {n: round(stage_timer.totals.get(n, 0.0), 4) for n in STAGE_NAMES}
         rendering_time = stage_timer.totals.get("rendering", 0.0)
         rendering_fps = rendering_frames / rendering_time if rendering_time > 0.0 else 0.0
 
-        # Latency buckets: update = method's per-frame reconstruction (sync-bounded
-        # sub-stages, excludes decode/eval/output renders/static init); E2E = decode + update + render.
-        update_time = sum(stage_timer.totals.get(s, 0.0) for s in UPDATE_STAGES)
-        e2e_time = decode_time + update_time + render_time
-        latency_metrics = {
-            "Decode time": round(decode_time, 6),
-            "Update time": round(update_time, 6),
-            "Render time (heldout)": round(render_time, 6),
-            "E2E time": round(e2e_time, 6),
-        }
-
         # Collect frame metrics for logging
-        if test_image_dataset.n_cams > 0:
+        if test_reader.n_cams > 0:
             frame_metrics = {
                 "Frame index": frame_idx,
                 "Loss": round(ema_loss_for_log,5),
@@ -1125,12 +1420,22 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 "PSNR (Val)": round(metrics['val']['psnr'].item(),2),
                 "Frame time": round(frame_time,2),
                 "Frame time IO": round(frame_time_io,2),
+                "Data loading time": round(data_loading_time, 4),
+                "Train data loading time": round(train_data_loading_time, 4),
+                "OpenCV frame time": round(opencv_frame_time, 4),
+                "OpenCV read time": round(opencv_read_time, 4),
+                "OpenCV convert time": round(opencv_convert_time, 4),
+                "Tensor convert time": round(tensor_convert_time, 4),
+                "Stack time": round(stack_time, 4),
+                "CUDA transfer time": round(cuda_transfer_time, 4),
+                "Load profiles": {
+                    "train": round_profile(frame_train_load_profile),
+                    "test": round_profile(frame_test_load_profile),
+                },
                 "Rendering time": round(rendering_time, 4),
                 "Rendering frames": rendering_frames,
                 "Rendering FPS": round(rendering_fps, 2),
                 "Stage times": stage_times,
-                **latency_metrics,
-                "Static init time": round(static_init_time, 6) if frame_idx == 1 else None,
                 "Training time elapsed": round(net_elapsed_time,2),
             }
         else:
@@ -1146,12 +1451,22 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 "PSNR (Val)": round(metrics['val']['psnr'].item(),2),
                 "Frame time": round(frame_time,2),
                 "Frame time IO": round(frame_time_io,2),
+                "Data loading time": round(data_loading_time, 4),
+                "Train data loading time": round(train_data_loading_time, 4),
+                "OpenCV frame time": round(opencv_frame_time, 4),
+                "OpenCV read time": round(opencv_read_time, 4),
+                "OpenCV convert time": round(opencv_convert_time, 4),
+                "Tensor convert time": round(tensor_convert_time, 4),
+                "Stack time": round(stack_time, 4),
+                "CUDA transfer time": round(cuda_transfer_time, 4),
+                "Load profiles": {
+                    "train": round_profile(frame_train_load_profile),
+                    "test": {},
+                },
                 "Rendering time": round(rendering_time, 4),
                 "Rendering frames": rendering_frames,
                 "Rendering FPS": round(rendering_fps, 2),
                 "Stage times": stage_times,
-                **latency_metrics,
-                "Static init time": round(static_init_time, 6) if frame_idx == 1 else None,
                 "Training time elapsed": round(net_elapsed_time,2),
             }
 
@@ -1170,6 +1485,12 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                                               if frame_idx>1 else gaussians._xyz.shape[0],
                        "frame/iter_time": frame_time,
                        "frame/iter_time_io": frame_time_io,
+                       "frame/data_loading_time": data_loading_time,
+                       "frame/train_data_loading_time": train_data_loading_time,
+                       "frame/opencv_read_time": opencv_read_time,
+                       "frame/opencv_convert_time": opencv_convert_time,
+                       "frame/tensor_convert_time": tensor_convert_time,
+                       "frame/cuda_transfer_time": cuda_transfer_time,
                        "frame/rendering_time": rendering_time,
                        "frame/rendering_frames": rendering_frames,
                        "frame/rendering_fps": rendering_fps,
@@ -1178,15 +1499,11 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                        "frame_idx": frame_idx}
             for _stage, _t in stage_times.items():
                 wandb_log[f"frame/stage_time/{_stage}"] = _t
-            wandb_log["frame/latency/decode"] = decode_time
-            wandb_log["frame/latency/update"] = update_time
-            wandb_log["frame/latency/render"] = render_time
-            wandb_log["frame/latency/e2e"] = e2e_time
             wandb.log(wandb_log)
 
 
         # Compute and display average metrics
-        if test_image_dataset.n_cams > 0:
+        if test_reader.n_cams > 0:
             avg_metrics = {
                 "Loss (Test)": round(sum([fm["Loss (Test)"] for fm in training_metrics])/len(training_metrics),5),
                 "Loss (Val)": round(sum([fm["Loss (Val)"] for fm in training_metrics])/len(training_metrics),5),
@@ -1194,6 +1511,14 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 "PSNR (Val)": round(sum([fm["PSNR (Val)"] for fm in training_metrics])/len(training_metrics),2),
                 "Size (MB)": round(sum([fm["Size (MB)"] for fm in training_metrics])),
                 "Frame time": round(sum([fm["Frame time"] for fm in training_metrics])/len(training_metrics),2),
+                "Data loading time": round(sum([fm["Data loading time"] for fm in training_metrics])/len(training_metrics),4),
+                "Train data loading time": round(sum([fm["Train data loading time"] for fm in training_metrics])/len(training_metrics),4),
+                "OpenCV frame time": round(sum([fm["OpenCV frame time"] for fm in training_metrics])/len(training_metrics),4),
+                "OpenCV read time": round(sum([fm["OpenCV read time"] for fm in training_metrics])/len(training_metrics),4),
+                "OpenCV convert time": round(sum([fm["OpenCV convert time"] for fm in training_metrics])/len(training_metrics),4),
+                "Tensor convert time": round(sum([fm["Tensor convert time"] for fm in training_metrics])/len(training_metrics),4),
+                "Stack time": round(sum([fm["Stack time"] for fm in training_metrics])/len(training_metrics),4),
+                "CUDA transfer time": round(sum([fm["CUDA transfer time"] for fm in training_metrics])/len(training_metrics),4),
                 "Rendering time": round(sum([fm["Rendering time"] for fm in training_metrics]), 4),
                 "Rendering FPS": round(
                     sum([fm["Rendering frames"] for fm in training_metrics])
@@ -1206,6 +1531,14 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 "PSNR (Val)": round(sum([fm["PSNR (Val)"] for fm in training_metrics])/len(training_metrics),2),
                 "Size (MB)": round(sum([fm["Size (MB)"] for fm in training_metrics])),
                 "Frame time": round(sum([fm["Frame time"] for fm in training_metrics])/len(training_metrics),2),
+                "Data loading time": round(sum([fm["Data loading time"] for fm in training_metrics])/len(training_metrics),4),
+                "Train data loading time": round(sum([fm["Train data loading time"] for fm in training_metrics])/len(training_metrics),4),
+                "OpenCV frame time": round(sum([fm["OpenCV frame time"] for fm in training_metrics])/len(training_metrics),4),
+                "OpenCV read time": round(sum([fm["OpenCV read time"] for fm in training_metrics])/len(training_metrics),4),
+                "OpenCV convert time": round(sum([fm["OpenCV convert time"] for fm in training_metrics])/len(training_metrics),4),
+                "Tensor convert time": round(sum([fm["Tensor convert time"] for fm in training_metrics])/len(training_metrics),4),
+                "Stack time": round(sum([fm["Stack time"] for fm in training_metrics])/len(training_metrics),4),
+                "CUDA transfer time": round(sum([fm["CUDA transfer time"] for fm in training_metrics])/len(training_metrics),4),
                 "Rendering time": round(sum([fm["Rendering time"] for fm in training_metrics]), 4),
                 "Rendering FPS": round(
                     sum([fm["Rendering frames"] for fm in training_metrics])
@@ -1215,7 +1548,7 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
         # Update progress display
         del frame_metrics["Training time elapsed"]
-        postfix_metrics = {k: v for k, v in frame_metrics.items() if k != "Stage times" and v is not None}
+        postfix_metrics = {k: v for k, v in frame_metrics.items() if k not in ["Stage times", "Load profiles"]}
         if enable_tqdm:
             progress_bar_frame.set_postfix(postfix_metrics)
             progress_bar_frame.update(1)
@@ -1227,6 +1560,49 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
           
     with open(os.path.join(args.model_path,'training_metrics.json'),'w') as f:
         json.dump(training_metrics, f, indent=4)
+    with open(os.path.join(args.model_path, 'first_frame_load_profile.json'), 'w') as f:
+        json.dump(first_frame_load_profile, f, indent=4)
+    with open(os.path.join(args.model_path, 'startup_profile.json'), 'w') as f:
+        json.dump(startup_profile, f, indent=4)
+    latency_metrics = [
+        {
+            "frame_idx": fm["Frame index"],
+            "frame_time": fm["Frame time"],
+            "data_loading_time": fm["Data loading time"],
+            "train_data_loading_time": fm["Train data loading time"],
+            "opencv_frame_time": fm["OpenCV frame time"],
+            "opencv_read_time": fm["OpenCV read time"],
+            "opencv_convert_time": fm["OpenCV convert time"],
+            "tensor_convert_time": fm["Tensor convert time"],
+            "stack_time": fm["Stack time"],
+            "cuda_transfer_time": fm["CUDA transfer time"],
+            "rendering_time": fm["Rendering time"],
+            "load_profiles": fm.get("Load profiles", {}),
+            "stage_times": fm.get("Stage times", {}),
+        }
+        for fm in training_metrics
+    ]
+    with open(os.path.join(args.model_path, 'latency_metrics.json'), 'w') as f:
+        json.dump(latency_metrics, f, indent=4)
+    all_frames_latency = build_latency_summary(training_metrics)
+    steady_state_metrics = [fm for fm in training_metrics if fm["Frame index"] > 1]
+    steady_state_latency = build_latency_summary(steady_state_metrics)
+    streaming_baseline_summary = {
+        "first_frame": {
+            "load_profile": first_frame_load_profile,
+            "startup_profile": startup_profile,
+        },
+        "steady_state_mean": steady_state_latency,
+        "all_frames_mean": all_frames_latency,
+        "notes": {
+            "opencv_read_time": "cv2.VideoCapture.read wall time; includes demux/decode/OpenCV buffering and BGR frame materialization.",
+            "train_data_loading_time": "Train split input latency: OpenCV read/convert, tensor conversion, stack, and CUDA transfer.",
+            "e2e_latency": "Mean frame_time plus mean train_data_loading_time.",
+            "steady_state_mean": "Frames with Frame index > 1; excludes first-frame startup behavior.",
+        },
+    }
+    with open(os.path.join(args.model_path, 'streaming_baseline_summary.json'), 'w') as f:
+        json.dump(streaming_baseline_summary, f, indent=4)
 
     # Per-stage timing summary (sum, mean, per-frame breakdown)
     stage_summary = {
@@ -1245,58 +1621,20 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         json.dump(stage_summary, f, indent=4)
 
     with open(os.path.join(args.model_path, 'avg_metrics.json'),'w') as f:
-        json.dump({**avg_metrics, "Stage times (mean)": stage_summary["mean"]}, f)
-
-    # Dedicated latency tables: initialization (frame 1, incl. static 3DGS init) vs
-    # steady-state per-frame updates (frames 2..N). E2E = decode + update + render.
-    init_frame = next((fm for fm in training_metrics if fm["Frame index"] == 1), None)
-    steady_frames = [fm for fm in training_metrics if fm["Frame index"] > 1]
-    initialization_latency = {} if init_frame is None else {
-        "frame_idx": 1,
-        "static_init_time": init_frame.get("Static init time"),
-        "decode_time": init_frame["Decode time"],
-        "update_time": init_frame["Update time"],
-        "render_time": init_frame["Render time (heldout)"],
-        "e2e_time": init_frame["E2E time"],
-    }
-    steady_state_latency = {
-        "decode": _latency_stats([fm["Decode time"] for fm in steady_frames]),
-        "update": _latency_stats([fm["Update time"] for fm in steady_frames]),
-        "render": _latency_stats([fm["Render time (heldout)"] for fm in steady_frames]),
-        "e2e": _latency_stats([fm["E2E time"] for fm in steady_frames]),
-    }
-    latency_summary = {
-        "timed": bool(dataset.timed),
-        "initialized_from_checkpoint": checkpoint if checkpoint is not None else False,
-        "note": "Meaningful only with --timed (num_workers=0, CUDA syncs). E2E = decode + update + render."
-                + (" Frame 1 loaded from checkpoint: static_init_time is ply-load time and update_time~0."
-                   if checkpoint is not None else ""),
-        "initialization": initialization_latency,
-        "steady_state": steady_state_latency,
-    }
-    with open(os.path.join(args.model_path, 'latency.json'), 'w') as f:
-        json.dump(latency_summary, f, indent=4)
-
-    # Print the two latency tables.
-    print('\nLatency tables (seconds)' + ('' if dataset.timed else '  [NOTE: run with --timed for accurate numbers]'))
-    if initialization_latency:
-        print('  Initialization (frame 1, loaded from checkpoint):' if checkpoint is not None
-              else '  Initialization (frame 1, one-time):')
-        _si_label = 'ply_load' if checkpoint is not None else 'static_init'
-        print(f"    {_si_label:>12} {'decode':>10} {'update':>10} {'render':>10} {'e2e':>10}")
-        _si = initialization_latency["static_init_time"]
-        print(f"    {(_si if _si is not None else 0.0):>12.4f} "
-              f"{initialization_latency['decode_time']:>10.4f} {initialization_latency['update_time']:>10.4f} "
-              f"{initialization_latency['render_time']:>10.4f} {initialization_latency['e2e_time']:>10.4f}")
-    if steady_frames:
-        print(f'  Steady-state per-frame updates (frames 2..N, n={len(steady_frames)}):')
-        print(f"    {'bucket':>8} {'mean':>10} {'std':>10} {'min':>10} {'max':>10}")
-        for _name in ["decode", "update", "render", "e2e"]:
-            _s = steady_state_latency[_name]
-            print(f"    {_name:>8} {_s['mean']:>10.4f} {_s['std']:>10.4f} {_s['min']:>10.4f} {_s['max']:>10.4f}")
+        json.dump({
+            **avg_metrics,
+            "First frame loading": first_frame_load_profile,
+            "Startup profile": startup_profile,
+            "Steady-state latency": steady_state_latency,
+            "All-frames latency": all_frames_latency,
+            "Stage times (mean)": stage_summary["mean"],
+        }, f)
 
     if enable_tqdm:
         progress_bar_frame.close()
+
+    train_reader.close()
+    test_reader.close()
 
     # Display final results
     print('\nFinal average training metrics:')
@@ -1312,6 +1650,28 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
             'average/val/loss_viewpoint/loss': avg_metrics["Loss (Val)"],
             'average/size': avg_metrics["Size (MB)"],
             'average/frame_time': avg_metrics["Frame time"],
+            'average/data_loading_time': avg_metrics["Data loading time"],
+            'average/train_data_loading_time': avg_metrics["Train data loading time"],
+            'average/opencv_frame_time': avg_metrics["OpenCV frame time"],
+            'average/opencv_read_time': avg_metrics["OpenCV read time"],
+            'average/opencv_convert_time': avg_metrics["OpenCV convert time"],
+            'average/tensor_convert_time': avg_metrics["Tensor convert time"],
+            'average/stack_time': avg_metrics["Stack time"],
+            'average/cuda_transfer_time': avg_metrics["CUDA transfer time"],
+            'first_frame/data_loading_time': first_frame_load_profile["data_loading_time"],
+            'first_frame/train_data_loading_time': first_frame_load_profile["train_data_loading_time"],
+            'first_frame/opencv_read_time': first_frame_load_profile["opencv_read_time"],
+            'first_frame/opencv_convert_time': first_frame_load_profile["opencv_convert_time"],
+            'first_frame/tensor_convert_time': first_frame_load_profile["tensor_convert_time"],
+            'first_frame/stack_time': first_frame_load_profile["stack_time"],
+            'first_frame/cuda_transfer_time': first_frame_load_profile["cuda_transfer_time"],
+            'startup/scene_init_time': startup_profile["scene_init_time"],
+            'startup/depth_init_time': startup_profile["depth_init_time"],
+            'startup/total_startup_time': startup_profile["total_startup_time"],
+            'steady_state/frame_time': steady_state_latency["frame_time"],
+            'steady_state/train_data_loading_time': steady_state_latency["train_data_loading_time"],
+            'steady_state/opencv_read_time': steady_state_latency["opencv_read_time"],
+            'steady_state/e2e_latency': steady_state_latency["e2e_latency"],
             'total/rendering_time': avg_metrics["Rendering time"],
             'average/rendering_fps': avg_metrics["Rendering FPS"],
             'average/elapsed_time': avg_metrics["Elapsed time"]
@@ -1320,12 +1680,6 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
             summary_dict[f"average/stage_time/{_stage}"] = _t
         for _stage, _t in stage_summary["total"].items():
             summary_dict[f"total/stage_time/{_stage}"] = _t
-        for _name in ["decode", "update", "render", "e2e"]:
-            summary_dict[f"steady_state/latency/{_name}_mean"] = steady_state_latency[_name]["mean"]
-            summary_dict[f"steady_state/latency/{_name}_std"] = steady_state_latency[_name]["std"]
-        if initialization_latency:
-            summary_dict["init/static_init_time"] = initialization_latency["static_init_time"]
-            summary_dict["init/e2e_time"] = initialization_latency["e2e_time"]
         wandb.run.summary.update(summary_dict)
 
 def prepare_output_and_logger(args):    
@@ -1449,21 +1803,20 @@ def training_report(tb_writer, wandb_enabled, model_args, frame_idx, iteration, 
                                            caption=f"Frame {frame_idx} | GT | Rendered | Error Diff")
                         })
                     if model_args.log_images:
-                        # Not logging GTs
                         os.makedirs(os.path.join(model_args.model_path,config['name'],"renders", 
                                                  camName_from_Path(viewpoint.image_path)),exist_ok=True)
                         if prev_report is None:
                             os.makedirs(os.path.join(model_args.model_path,config['name'],"gt", 
                                                      camName_from_Path(viewpoint.image_path)),exist_ok=True)
-                            if os.path.exists(os.path.join(
-                                                model_args.model_path,config['name'],"gt", 
-                                                camName_from_Path(viewpoint.image_path),str(model_args.start_idx+frame_idx).zfill(4)+".png"
-                                                )
-                                            ):
-                                os.remove(os.path.join(model_args.model_path,config['name'],"gt", 
-                                                       camName_from_Path(viewpoint.image_path),str(model_args.start_idx+frame_idx).zfill(4)+".png"))
-                            os.symlink(viewpoint.image_path,os.path.join(model_args.model_path,config['name'],"gt", 
-                                                                         camName_from_Path(viewpoint.image_path),str(model_args.start_idx+frame_idx).zfill(4)+".png"))
+                            gt_path = os.path.join(model_args.model_path,config['name'],"gt",
+                                                   camName_from_Path(viewpoint.image_path),
+                                                   str(model_args.start_idx+frame_idx).zfill(4)+".png")
+                            if os.path.exists(gt_path):
+                                os.remove(gt_path)
+                            if getattr(model_args, "stream_video", False):
+                                save_image(gt_image, gt_path)
+                            else:
+                                os.symlink(viewpoint.image_path, gt_path)
 
                         save_image(image,os.path.join(model_args.model_path,config['name'],"renders",
                                                       camName_from_Path(viewpoint.image_path),str(model_args.start_idx+frame_idx).zfill(4)+".png"))
@@ -1582,9 +1935,13 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument('--init_from_ply', action='store_true', default=False,
-                        help='On/off toggle: initialize frame 1 from <source_path>/init_3dgs.ply and skip the static 3DGS training. The filename is fixed (init_3dgs.ply) per scene.')
     parser.add_argument('--use_xyz_legacy', action='store_true', default=False, help='If set, use legacy xyz decoding in GaussianModel (_xyz_legacy) to reproduce paper numbers. To save compressed pkl\'s, leave unset or set to False. Default: False (use _xyz_fixed).')
+    parser.add_argument('--video_filename', type=str, default="",
+                        help='Video filename inside each cam* directory, e.g. video.mp4. If unset, auto-detects a single common video file.')
+    parser.add_argument('--video_glob', type=str, default="",
+                        help='Glob pattern for selecting videos, e.g. "cam*.mp4". Applied inside --video_dir when it exists, otherwise inside each cam* directory.')
+    parser.add_argument('--video_dir', type=str, default="videos",
+                        help='Directory containing camera videos named cam00.mp4, cam01.mp4, etc. Relative to source_path by default.')
     args = parser.parse_args(sys.argv[1:])
     # args.save_iterations.append(args.iterations)
 
@@ -1597,12 +1954,6 @@ if __name__ == "__main__":
         if not args.model_path:
             args.model_path = os.path.join("output/n3dv_origin", args.scene)
 
-    # On/off toggle for ply init: derive the fixed per-scene path <source_path>/init_3dgs.ply.
-    if args.init_from_ply:
-        if not args.source_path:
-            raise ValueError("--init_from_ply requires source_path (set --scene or --source_path).")
-        args.start_checkpoint = os.path.join(args.source_path, "init_3dgs.ply")
-
     # Merge optimization args for initial and rest and change accordingly
     op = OptimizationParams(op_i.extract(args), op_r.extract(args))
 
@@ -1612,6 +1963,10 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     lp_args = lp.extract(args)
+    lp_args.stream_video = True
+    lp_args.video_filename = args.video_filename
+    lp_args.video_glob = args.video_glob
+    lp_args.video_dir = args.video_dir
     pp_args = pp.extract(args)
     qp_args = qp.extract(args)
 

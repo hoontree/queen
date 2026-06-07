@@ -1,6 +1,8 @@
 
 model_params:
-    sh_degree: 2
+    # data_root + --scene <name> resolves source_path to <data_root>/<scene>
+    data_root: '/home/hheo/data/dynerf/n3dv'
+    sh_degree: 0
     flow_loss_type: 'warp'
     flow_batch: 16
     flow_scale: 0.8
@@ -33,15 +35,15 @@ model_params:
     depth_until_iter: 10000
 
     # fill these in for your wandb logging
-    wandb_project: ''
-    wandb_entity: ''
+    wandb_project: 'mlvu'
+    wandb_entity: 'hheo'
     wandb_log_error_maps: True
     wandb_log_error_map_frames: 300 # log error maps for all 300 frames in dynerf sequences
     wandb_error_map_vmin: 0.0
     wandb_error_map_vmax: 0.4 # all errors above 0.4 are clamped to red
     wandb_error_map_cmap: "jet"
     wandb_tags: 'default'
-    use_wandb: False
+    use_wandb: True
 
 quantize_params:
     xyz_quant_type: 'none'
