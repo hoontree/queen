@@ -127,13 +127,15 @@ def render_sets(dataset: ModelParams, opt: OptimizationParams, pipeline: Pipelin
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+        # Load weights from the per-frame path, but save renders/gt at the top-level
+        # model_path so that `metrics.py -m <model_path>` finds <model_path>/test/ours_<iter>/.
         if not skip_train:
             print("Rendering training set frame {}".format(start_frame_idx))
-            render_set(scene.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background)
+            render_set(args.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background)
 
         if not skip_test:
             print("Rendering test set frame {}".format(start_frame_idx))
-            render_set(scene.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background)
+            render_set(args.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background)
 
         fps = measure_fps(scene, gaussians, pipeline, background, use_amp=False)
 
@@ -160,6 +162,8 @@ if __name__ == "__main__":
     qp = QuantizeParams(parser, config['quantize_params'])
 
     parser.add_argument('--config', type=str, default=None)
+    parser.add_argument('--scene', type=str, default=None,
+                        help='Scene name. If set, source_path is resolved to <data_root>/<scene> and model_path defaults to output/<scene> when unset.')
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
@@ -167,7 +171,16 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     args = parser.parse_args(sys.argv[1:])
-    
+
+    # If --scene is set, resolve source_path and (optionally) model_path from data_root
+    if args.scene:
+        if not args.data_root:
+            raise ValueError("--scene requires data_root to be set (in yaml model_params.data_root or via --data_root).")
+        if not args.source_path:
+            args.source_path = os.path.join(args.data_root, args.scene)
+        if not args.model_path:
+            args.model_path = os.path.join("output", args.scene)
+
     # Merge optimization args for initial and rest and change accordingly
     op = OptimizationParams(op_i.extract(args), op_r.extract(args))
 
