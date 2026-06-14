@@ -266,45 +266,37 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     net_elapsed_time = 0.0
     net_iter_time = 0.0
 
-    # Per-stage timing (seconds, accumulated per frame). Training render is separate
-    # from rendering used for validation/output so FPS excludes loss render time.
-    # "heldout_render" is the dedicated latency render of G_t into one held-out view.
-    STAGE_NAMES = ["initialization", "motion_estimation", "gaussian_selection",
-                   "train_render_forward", "loss_backward", "optimizer_step",
-                   "densify_prune", "rendering", "heldout_render"]
-
-    # Stages that constitute the method's per-frame "update" (reconstruction) latency:
-    # everything from "frames available" to "G_t ready". Excludes decode, validation/
-    # spiral renders, the held-out latency render, saving, and the first-frame static init.
-    UPDATE_STAGES = ["motion_estimation", "gaussian_selection",
-                     "train_render_forward", "loss_backward", "optimizer_step",
-                     "densify_prune"]
+    # Coarse 3-bucket latency reported per frame (seconds): Decode, Update,
+    # Render (held-out latency render of G_t into one held-out view), plus E2E.
     LATENCY_FIELDS = ["Decode time", "Update time", "Render time (heldout)", "E2E time"]
 
-    class StageTimer:
+    # Coarse 3-bucket latency: Decode / Update / Render(+E2E), with CUDA syncs ONLY at
+    # frame-level bucket boundaries (no per-stage/per-iteration syncs). The Update bucket
+    # is a single wall-clock span over the reconstruction (frame setup + training loop);
+    # decode (binding), the held-out render, and validation/spiral renders are kept out of
+    # it via pause()/resume() or by subtracting the synced eval-render time.
+    class SpanTimer:
+        """Single wall-clock accumulator with optional CUDA sync at span boundaries."""
         def __init__(self, sync):
             self.sync = sync
-            self.totals = {}
+            self.total = 0.0
             self._t0 = None
-            self._cur = None
         def reset(self):
-            self.totals = {n: 0.0 for n in STAGE_NAMES}
-        def start(self, name):
-            assert self._cur is None, f"StageTimer: {self._cur} not stopped before starting {name}"
+            self.total = 0.0
+            self._t0 = None
+        def resume(self):
             if self.sync:
                 torch.cuda.synchronize()
-            self._cur = name
             self._t0 = time.time()
-        def stop(self):
-            if self._cur is None:
+        def pause(self):
+            if self._t0 is None:
                 return
             if self.sync:
                 torch.cuda.synchronize()
-            self.totals[self._cur] = self.totals.get(self._cur, 0.0) + (time.time() - self._t0)
-            self._cur = None
+            self.total += time.time() - self._t0
             self._t0 = None
 
-    stage_timer = StageTimer(sync=dataset.timed)
+    update_sw = SpanTimer(sync=dataset.timed)
 
     training_start = time.time()
 
@@ -325,8 +317,6 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         wandb.define_metric("frame/rendering_frames", step_metric="frame_idx")
         wandb.define_metric("frame/rendering_fps", step_metric="frame_idx")
         wandb.define_metric("frame/elapsed", step_metric="frame_idx")
-        for _stage in STAGE_NAMES:
-            wandb.define_metric(f"frame/stage_time/{_stage}", step_metric="frame_idx")
         for _lat in ["decode", "update", "render", "e2e"]:
             wandb.define_metric(f"frame/latency/{_lat}", step_metric="frame_idx")
 
@@ -382,8 +372,9 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
             torch.cuda.synchronize()
         frame_start_io = time.time()
         frame_time_io = 0.0
-        stage_timer.reset()
-        initialization_start = time.time() if frame_idx == 1 else None
+        update_sw.reset()
+        eval_render_time = 0.0   # validation/spiral renders inside the loop (excluded from Update)
+        render_time = 0.0        # held-out render bucket
         rendering_frames = 0
 
         # Decode latency of the current frame's training views (carried over from the
@@ -404,14 +395,14 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
             pending_train_decode_time = 0.0
             opt.lambda_flow = 0.0
 
-        if dataset.timed:
-            torch.cuda.synchronize()
+        # Begin the Update span (frame setup + training loop). resume() does the only
+        # frame-boundary CUDA sync; the held-out render and eval renders are kept out below.
+        update_sw.resume()
         frame_start = time.time()
         frame_time = 0.0
 
         # Update a bunch of variables and models for each new frame
         if frame_idx > 1:
-            stage_timer.start("motion_estimation")
 
             # Initialize gate probabilities based on gradient differences or frame differences
             if dataset.update_mask == "viewspace_diff":
@@ -463,8 +454,6 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
                 gaussian_mask = grad_diff>dataset.gaussian_update_thresh
 
-            stage_timer.stop()  # end motion_estimation (viewspace_diff path or none)
-
             with torch.no_grad():
 
                 # Load optimizer hyperparams (initial or rest) based on frame index
@@ -472,18 +461,14 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 opt.iterations = frame_iters[frame_idx-1]
                 opt.epochs = (opt.iterations//n_cams)
                 gaussians.frame_idx = frame_idx
-                # Residual/optimizer setup is part of the per-frame update (residual learning).
-                stage_timer.start("gaussian_selection")
                 # Create decoder and latents for quantized residuals if first time
                 # Else reset latent values to 0
                 gaussians.update_residuals()
                 # Redefine the optimizer and other tracked variables for the gaussian model
                 gaussians.training_setup(opt)
-                stage_timer.stop()  # residual/optimizer setup (folded into gaussian_selection)
                 # Load the current test data (Preloaded data for next frame is only for training)
                 train_images, train_paths = cur_train_images, cur_train_paths
-                if dataset.timed:
-                    torch.cuda.synchronize()
+                update_sw.pause()  # exclude test-data load from the Update span
                 frame_time += time.time() - frame_start
                 if test_image_dataset.n_cams > 0:
                     test_data = next(test_loader)
@@ -492,32 +477,29 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                     if frame_idx == start_frame_idx:
                         print('No test cameras found, disabling testing.')
                     test_images, test_paths = None, None
-                if dataset.timed:
-                    torch.cuda.synchronize()
+                update_sw.resume()
                 frame_start = time.time()
                 train_image_data = {'image':train_images,'path':train_paths}
                 test_image_data = {'image':test_images,'path':test_paths}
-            
+
                 # Update the images and paths for all cameras in the scene with new frame index.
                 # Binding the decoded tensors into camera objects makes the frame available to
-                # the model, so its cost is folded into decode_time.
-                _sync_cuda(dataset.timed)
+                # the model, so its cost is folded into decode_time (excluded from Update).
+                update_sw.pause()
                 _bind_t0 = time.time()
                 scene.updateCameraImages(args, train_image_data, test_image_data, frame_idx, resolution_scales=[1.0])
                 _sync_cuda(dataset.timed)
                 decode_time += time.time() - _bind_t0
+                update_sw.resume()
                 train_cameras = scene.getTrainCameras()
 
                 # If using a frame difference or 2d flow mask for gate initialization and adaptive masked training
                 if dataset.update_mask =="diff":
-                    stage_timer.start("motion_estimation")
                     flow_norm = torch.norm((prev_frame_views-cur_frame_views),dim=1,keepdim=True)/np.sqrt(3) # normalize across rgb
 
                     # Mask if using fixed threshold
                     flow_mask = flow_norm>dataset.pixel_update_thresh
-                    stage_timer.stop()
 
-                stage_timer.start("gaussian_selection")
                 if dataset.update_mask =="diff":
                     if dataset.adaptive_render and dataset.adaptive_update_period>0.0:
                         bg = torch.rand((3), device="cuda") if opt.random_background else background
@@ -604,7 +586,6 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 if dataset.flow_update and opt.lambda_flow>0.0:
                     gaussians.update_points_flow()
                 prev_frame_views = cur_frame_views
-            stage_timer.stop()  # end gaussian_selection
 
         # When resuming frame 1 from a checkpoint, skip the static training loop entirely.
         load_checkpoint = (frame_idx == 1 and checkpoint is not None)
@@ -623,8 +604,8 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         frame_start_io = time.time()
 
         # Frame 1 loaded from checkpoint: run a single eval pass (no optimization) so the
-        # frame-1 PSNR/metrics are reported. The eval render counts as evaluation overhead
-        # (the "rendering" stage), not as update latency.
+        # frame-1 PSNR/metrics are reported. The eval render counts as evaluation overhead,
+        # not as update latency.
         if load_checkpoint:
             net_elapsed_time = time.time() - training_start
             cur_size = gaussians.size()/8/(10**6)
@@ -634,7 +615,7 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                                      render_mask, (pipe, background), prev_report=None,
                                      report_alpha=True, max_iterations=opt.iterations)
             if report:
-                stage_timer.totals["rendering"] += report.get("_render_time", 0.0)
+                eval_render_time += report.get("_render_time", 0.0)
                 rendering_frames += report.get("_render_count", 0)
                 report_configs = ['test', 'val'] if 'test' in report.keys() else ['val']
                 for config_name in report_configs:
@@ -649,8 +630,6 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
             if enable_debug:
                 print(f"DEBUG: started iteration {iteration}")
 
-            if dataset.timed:
-                torch.cuda.synchronize()
             iter_start = time.time()
 
             # Handle quantization and freezing of latent parameters
@@ -739,7 +718,6 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                     pixel_mask = viewpoint_cam.mask
             
             # render
-            stage_timer.start("train_render_forward")
             render_pkg = render_mask(viewpoint_cam, gaussians, pipe, bg, image_shape=gt_image.shape,
                                      color_mask=color_rw_mask, render_depth=opt.lambda_depth>0.0,
                                      backward_alpha=opt.lambda_alpha>0.0,
@@ -749,8 +727,6 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
             image, viewspace_point_tensor = render_pkg["render"], render_pkg["viewspace_points"]
             visibility_filter, radii = render_pkg["visibility_filter"], render_pkg["radii"]
-            stage_timer.stop()
-            stage_timer.start("loss_backward")
 
             # Compute main reconstruction losses
             loss, Ll1 = torch.Tensor([0.0]).to(image.device), torch.Tensor([0.0]).to(image.device)
@@ -840,13 +816,10 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 consistency_loss = 1- l1_loss(prev_image*gt_diff, cur_image*gt_diff)
                 loss += opt.lambda_consistency*consistency_loss
             loss.backward()
-            stage_timer.stop()  # end loss_backward
             if enable_debug:
                 print(f'DEBUG ({iteration}): backpropagated')
 
             with torch.no_grad():
-                if dataset.timed:
-                    torch.cuda.synchronize()
                 frame_time += time.time() - iter_start
                 frame_time_io += time.time() - iter_start
                 net_elapsed_time = time.time() - training_start
@@ -862,7 +835,7 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                                          l1_loss, cur_size, frame_time, is_test, scene, 
                                          render_mask, (pipe, background), prev_report=report, report_alpha=True, max_iterations=opt.iterations)
                 if report:
-                    stage_timer.totals["rendering"] += report.get("_render_time", 0.0)
+                    eval_render_time += report.get("_render_time", 0.0)
                     rendering_frames += report.get("_render_count", 0)
                 if enable_debug:
                     print(f'DEBUG ({iteration}): training_report done')
@@ -902,11 +875,8 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 # Note: PLY saving moved after iteration loop to match PKL timing (after densification/pruning)
 
 
-                if dataset.timed:
-                    torch.cuda.synchronize()
                 iter_start = time.time()
 
-                stage_timer.start("densify_prune")
                 if iteration <=opt.prune_until_iter:
                     gaussians.add_influence_stats(render_pkg["influence"])
 
@@ -948,9 +918,6 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                     if enable_debug:
                         print(f'DEBUG ({iteration}): pruning done')
 
-                stage_timer.stop()  # end densify_prune
-                if dataset.timed:
-                    torch.cuda.synchronize()
                 frame_time += time.time()-iter_start
                 frame_time_io += time.time()-iter_start
                 with torch.no_grad():
@@ -975,9 +942,11 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                             torchvision.utils.save_image(train_cameras[cam_idx].orig_mask.unsqueeze(0)*gt_image,
                                                          os.path.join(scene.model_path, "orig_mask.png"))
                         video_camera = video_cameras[frame_idx-1]
-                        stage_timer.start("rendering")
+                        _sync_cuda(dataset.timed)
+                        _er0 = time.time()
                         spiral_img = render(video_camera, gaussians, pipe, background)["render"]
-                        stage_timer.stop()
+                        _sync_cuda(dataset.timed)
+                        eval_render_time += time.time() - _er0
                         rendering_frames += 1
                         if frame_idx == 1:
                             os.makedirs(os.path.join(dataset.model_path,"spiral"), exist_ok=True)
@@ -985,10 +954,12 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
                         if frame_idx == 1:
                             with torch.no_grad():
-                                stage_timer.start("rendering")
-                                render_pkg = render_mask(viewpoint_cam, gaussians, pipe, bg, image_shape=gt_image.shape, 
+                                _sync_cuda(dataset.timed)
+                                _er0 = time.time()
+                                render_pkg = render_mask(viewpoint_cam, gaussians, pipe, bg, image_shape=gt_image.shape,
                                                          color_mask=color_rw_mask, render_depth=True)
-                                stage_timer.stop()
+                                _sync_cuda(dataset.timed)
+                                eval_render_time += time.time() - _er0
                                 rendering_frames += 1
                                 pred_depth = render_pkg["depth"]
                                 render_depth = pred_depth.detach().cpu().numpy()
@@ -1008,10 +979,7 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                                 torchvision.utils.save_image(torch.tensor(depth_err).unsqueeze(0),os.path.join(dataset.model_path,'err_depth_gray.png'))
 
                 # Optimizer step
-                if dataset.timed:
-                    torch.cuda.synchronize()
                 iter_start = time.time()
-                stage_timer.start("optimizer_step")
                 if iteration <= opt.iterations:
                     # gaussians.update_grads()
                     gaussians.optimizer.step()
@@ -1019,28 +987,32 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                     if gaussians.gate_atts is not None and gaussians.gate_atts.training:
                         gaussians.gate_atts.step()
                         gaussians.gate_atts.clamp_params()
-                stage_timer.stop()
-                if dataset.timed:
-                    torch.cuda.synchronize()
                 frame_time += time.time()-iter_start
                 frame_time_io += time.time()-iter_start
                 if enable_debug:
                     print(f'DEBUG ({iteration}): Optimizer step done')
         # end training loop for this frame
 
+        # Close the Update span (reconstruction is done) before the held-out render.
+        # Update bucket = reconstruction wall-clock minus the validation/spiral renders that
+        # ran inside the loop. Decode binding and the held-out render are already excluded
+        # (binding via pause/resume, held-out render measured separately below).
+        update_sw.pause()
+        update_time = max(update_sw.total - eval_render_time, 0.0)
+
         # Render latency: rasterize the updated G_t into ONE held-out test view.
         # PSNR/SSIM/LPIPS are intentionally excluded (evaluation overhead, not latency).
-        # The trailing synchronize() in stage_timer.stop() also serves as the E2E final sync.
         if test_image_dataset.n_cams > 0:
             heldout_cam = scene.getTestCameras()[0]
             with torch.no_grad():
-                stage_timer.start("heldout_render")
+                _sync_cuda(dataset.timed)
+                _hr0 = time.time()
                 _ = render_mask(heldout_cam, gaussians, pipe, background,
                                 image_shape=heldout_cam.original_image.shape)["render"]
-                stage_timer.stop()
+                _sync_cuda(dataset.timed)
+                render_time = time.time() - _hr0
         elif frame_idx == start_frame_idx:
             print('No test cameras found; held-out render time will be 0.0 (requires a held-out view).')
-        render_time = stage_timer.totals.get("heldout_render", 0.0)
 
         if dataset.timed:
             torch.cuda.synchronize()
@@ -1091,17 +1063,11 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         frame_time += time.time()-frame_start
         frame_time_io += time.time()-frame_start
 
-        if initialization_start is not None:
-            if dataset.timed:
-                torch.cuda.synchronize()
-            stage_timer.totals["initialization"] = time.time() - initialization_start
-        stage_times = {n: round(stage_timer.totals.get(n, 0.0), 4) for n in STAGE_NAMES}
-        rendering_time = stage_timer.totals.get("rendering", 0.0)
+        rendering_time = eval_render_time
         rendering_fps = rendering_frames / rendering_time if rendering_time > 0.0 else 0.0
 
-        # Latency buckets: update = method's per-frame reconstruction (sync-bounded
-        # sub-stages, excludes decode/eval/output renders/static init); E2E = decode + update + render.
-        update_time = sum(stage_timer.totals.get(s, 0.0) for s in UPDATE_STAGES)
+        # Latency buckets (frame-boundary syncs only): update measured above as one
+        # reconstruction span; E2E = decode + update + render.
         e2e_time = decode_time + update_time + render_time
         latency_metrics = {
             "Decode time": round(decode_time, 6),
@@ -1128,7 +1094,6 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 "Rendering time": round(rendering_time, 4),
                 "Rendering frames": rendering_frames,
                 "Rendering FPS": round(rendering_fps, 2),
-                "Stage times": stage_times,
                 **latency_metrics,
                 "Static init time": round(static_init_time, 6) if frame_idx == 1 else None,
                 "Training time elapsed": round(net_elapsed_time,2),
@@ -1149,7 +1114,6 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 "Rendering time": round(rendering_time, 4),
                 "Rendering frames": rendering_frames,
                 "Rendering FPS": round(rendering_fps, 2),
-                "Stage times": stage_times,
                 **latency_metrics,
                 "Static init time": round(static_init_time, 6) if frame_idx == 1 else None,
                 "Training time elapsed": round(net_elapsed_time,2),
@@ -1176,8 +1140,6 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                        "frame/elapsed": net_elapsed_time,
                        "frame/num_iterations": opt.iterations if frame_idx>1 else 0,
                        "frame_idx": frame_idx}
-            for _stage, _t in stage_times.items():
-                wandb_log[f"frame/stage_time/{_stage}"] = _t
             wandb_log["frame/latency/decode"] = decode_time
             wandb_log["frame/latency/update"] = update_time
             wandb_log["frame/latency/render"] = render_time
@@ -1215,7 +1177,7 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
         # Update progress display
         del frame_metrics["Training time elapsed"]
-        postfix_metrics = {k: v for k, v in frame_metrics.items() if k != "Stage times" and v is not None}
+        postfix_metrics = {k: v for k, v in frame_metrics.items() if v is not None}
         if enable_tqdm:
             progress_bar_frame.set_postfix(postfix_metrics)
             progress_bar_frame.update(1)
@@ -1228,24 +1190,8 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     with open(os.path.join(args.model_path,'training_metrics.json'),'w') as f:
         json.dump(training_metrics, f, indent=4)
 
-    # Per-stage timing summary (sum, mean, per-frame breakdown)
-    stage_summary = {
-        "stage_names": STAGE_NAMES,
-        "per_frame": [
-            {"frame_idx": fm["Frame index"], **fm.get("Stage times", {})}
-            for fm in training_metrics
-        ],
-        "total": {n: round(sum(fm.get("Stage times", {}).get(n, 0.0) for fm in training_metrics), 4)
-                  for n in STAGE_NAMES},
-        "mean": {n: round(sum(fm.get("Stage times", {}).get(n, 0.0) for fm in training_metrics)
-                          / max(len(training_metrics), 1), 4)
-                 for n in STAGE_NAMES},
-    }
-    with open(os.path.join(args.model_path, 'stage_times.json'), 'w') as f:
-        json.dump(stage_summary, f, indent=4)
-
     with open(os.path.join(args.model_path, 'avg_metrics.json'),'w') as f:
-        json.dump({**avg_metrics, "Stage times (mean)": stage_summary["mean"]}, f)
+        json.dump(avg_metrics, f)
 
     # Dedicated latency tables: initialization (frame 1, incl. static 3DGS init) vs
     # steady-state per-frame updates (frames 2..N). E2E = decode + update + render.
@@ -1316,10 +1262,6 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
             'average/rendering_fps': avg_metrics["Rendering FPS"],
             'average/elapsed_time': avg_metrics["Elapsed time"]
         }
-        for _stage, _t in stage_summary["mean"].items():
-            summary_dict[f"average/stage_time/{_stage}"] = _t
-        for _stage, _t in stage_summary["total"].items():
-            summary_dict[f"total/stage_time/{_stage}"] = _t
         for _name in ["decode", "update", "render", "e2e"]:
             summary_dict[f"steady_state/latency/{_name}_mean"] = steady_state_latency[_name]["mean"]
             summary_dict[f"steady_state/latency/{_name}_std"] = steady_state_latency[_name]["std"]

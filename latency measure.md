@@ -1,5 +1,11 @@
 # train.py latency measure
 
+> **버전 안내**: `main` 브랜치의 `train.py`는 **단순화된 3버킷 버전**입니다 — StageTimer 없이
+> Decode / Update / Render(+E2E)만 측정하고, CUDA sync를 **프레임 경계에서만** 수행합니다
+> (Update는 reconstruction 전체를 한 번의 wall-clock span으로 측정: `SpanTimer.resume()/pause()`).
+> 구간별(stage) 세분화 타이밍이 필요하면 **`latency-stagewise` 브랜치**(여기 아래 3~5절에서 설명하는
+> StageTimer 버전)를 사용하세요. 아래 1~2절의 버킷 정의/`--timed` 전제는 두 버전에 공통입니다.
+
 ## 1. 무엇을 측정하나 (4개 latency 버킷)
 
 QUEEN은 프레임이 하나씩 들어오는 온라인 스트리밍 학습이라, "프레임 1장이 들어와서 → 모델이 갱신되고 → 새 뷰로 렌더될 때까지"의 시간을 단계별로 나눠 측정합니다.
